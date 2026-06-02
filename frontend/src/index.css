@@ -1,0 +1,44 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Orbitron:wght@400;700;900&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { @apply border-border; }
+  body {
+    @apply bg-dark-900 text-slate-100;
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+@layer utilities {
+  .text-glow-cyan  { text-shadow: 0 0 10px #22d3ee, 0 0 20px #22d3ee; }
+  .text-glow-purple{ text-shadow: 0 0 10px #a855f7, 0 0 20px #a855f7; }
+  .border-glow     { box-shadow: 0 0 10px rgba(34,211,238,0.3), inset 0 0 10px rgba(34,211,238,0.05); }
+  .border-glow-hover:hover { box-shadow: 0 0 20px rgba(34,211,238,0.5), inset 0 0 20px rgba(34,211,238,0.1); }
+  .bg-cyber-pattern {
+    background-image: linear-gradient(rgba(34,211,238,0.03) 1px,transparent 1px),
+                      linear-gradient(90deg,rgba(34,211,238,0.03) 1px,transparent 1px);
+    background-size: 50px 50px;
+  }
+  .gradient-border {
+    background: linear-gradient(135deg,#22d3ee,#a855f7);
+    padding: 1px;
+  }
+  .gradient-border-inner { @apply bg-dark-800 rounded-lg; }
+}
+
+::-webkit-scrollbar       { width: 6px; }
+::-webkit-scrollbar-track { background: #0f172a; }
+::-webkit-scrollbar-thumb { background: #22d3ee; border-radius: 3px; }
+
+@keyframes scanline {
+  0%   { transform: translateY(-100%); }
+  100% { transform: translateY(100vh); }
+}
+.scanline {
+  position: fixed; top: 0; left: 0; right: 0; height: 2px;
+  background: linear-gradient(90deg,transparent,#22d3ee,transparent);
+  animation: scanline 4s linear infinite;
+  pointer-events: none; z-index: 9999; opacity: 0.3;
+}
