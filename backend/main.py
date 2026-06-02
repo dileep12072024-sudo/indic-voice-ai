@@ -1,43 +1,86 @@
-import io
+"""
+backend/main.py  — Phase 4A
+────────────────────────────
+IndicVoice AI API with asynchronous job system.
+
+New in Phase 4A:
+  POST /generate  → validates input, creates job, starts background worker,
+                    returns 202 Accepted { job_id, poll_url } immediately.
+  GET  /job/{id}  → returns current job status + output URL when completed.
+  GET  /job/{id}/download → redirect to the output file (local dev only).
+
+All TTS logic is isolated in EdgeTTSProvider.
+All storage I/O goes through LocalStorageBackend.
+Both are swappable for production equivalents (Azure / CF R2) without
+touching routes or job orchestration code.
+"""
+
+from __future__ import annotations
+
 import logging
-import struct
+import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
-import asyncio
-import edge_tts
-import miniaudio
-
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+
+from jobs import Job, JobMeta, JobStatus, LocalJobManager
+from providers import (
+    EdgeTTSProvider,
+    SynthesisRequest,
+    TTSNoAudioError,
+    TTSProviderError,
+    TTSUnavailableError,
+)
+from storage import LocalStorageBackend
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
+    format="%(asctime)s  %(levelname)s  %(name)s  %(message)s",
 )
 logger = logging.getLogger("indicvoice")
 
 # ── Directories ────────────────────────────────────────────────────────────
 BASE_DIR    = Path(__file__).parent
+STORAGE_DIR = BASE_DIR          # uploads/ and outputs/ sit directly under backend/
 UPLOADS_DIR = BASE_DIR / "uploads"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 UPLOADS_DIR.mkdir(exist_ok=True)
 OUTPUTS_DIR.mkdir(exist_ok=True)
 
+# ── Singletons (created once at startup) ──────────────────────────────────
+job_manager = LocalJobManager()
+storage     = LocalStorageBackend(base_dir=STORAGE_DIR, serve_prefix="/files")
+tts         = EdgeTTSProvider()
+
+
+# ── Lifespan ────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("IndicVoice AI API starting  provider=%s", tts.name)
+    yield
+    logger.info("IndicVoice AI API shutting down")
+
+
 # ── App ────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="IndicVoice AI API",
     description=(
-        "Backend API for IndicVoice AI — an AI Voice Synthesis platform "
-        "supporting Telugu, Tamil, Hindi, and English.\n\n"
-        "**Phase 3A** uses Microsoft Neural TTS (edge-tts) for real speech "
-        "synthesis across all four supported languages."
+        "Backend API for IndicVoice AI — Phase 4A async job system.\n\n"
+        "**POST /generate** accepts a voice sample + text + language and "
+        "returns a `job_id` immediately (HTTP 202). "
+        "Poll **GET /job/{job_id}** for status and the output URL."
     ),
-    version="2.0.0",
+    version="3.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # ── CORS ───────────────────────────────────────────────────────────────────
@@ -55,142 +98,100 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── TTS configuration ──────────────────────────────────────────────────────
-# Microsoft Neural TTS voices via edge-tts.
-# Voices confirmed working as of 2024 — see DEVELOPMENT.md for alternatives.
-LANGUAGE_CONFIG: dict[str, dict] = {
-    "te": {
-        "name":    "Telugu",
-        "voice":   "te-IN-ShrutiNeural",
-        "gender":  "Female",
-        "locale":  "te-IN",
-    },
-    "ta": {
-        "name":    "Tamil",
-        "voice":   "ta-IN-PallaviNeural",
-        "gender":  "Female",
-        "locale":  "ta-IN",
-    },
-    "hi": {
-        "name":    "Hindi",
-        "voice":   "hi-IN-SwaraNeural",
-        "gender":  "Female",
-        "locale":  "hi-IN",
-    },
-    "en": {
-        "name":    "English",
-        "voice":   "en-US-JennyNeural",
-        "gender":  "Female",
-        "locale":  "en-US",
-    },
+# ── Static-file serving (local dev: expose outputs/ and uploads/) ──────────
+# Clients use the URL returned by GET /job/{id}.output_url to download WAVs.
+# In production this is replaced by Cloudflare R2 pre-signed URLs.
+app.mount("/files", StaticFiles(directory=str(STORAGE_DIR)), name="files")
+
+
+# ── Validation constants ───────────────────────────────────────────────────
+SUPPORTED_LANGUAGES: dict[str, dict] = {
+    "te": {"name": "Telugu",  "voice": "te-IN-ShrutiNeural"},
+    "ta": {"name": "Tamil",   "voice": "ta-IN-PallaviNeural"},
+    "hi": {"name": "Hindi",   "voice": "hi-IN-SwaraNeural"},
+    "en": {"name": "English", "voice": "en-US-JennyNeural"},
 }
-
-# Output WAV parameters — fixed for consistent downstream playback
-OUTPUT_SAMPLE_RATE = 22050
-OUTPUT_CHANNELS    = 1          # mono
-OUTPUT_SAMPLE_WIDTH = 2         # 16-bit
-
-# Upload limits
-MAX_UPLOAD_BYTES   = 50 * 1024 * 1024   # 50 MB
+MAX_UPLOAD_BYTES   = 50 * 1024 * 1024
 ACCEPTED_EXTENSIONS = {".wav", ".mp3", ".ogg", ".webm", ".flac"}
 
 
-# ── TTS helpers ────────────────────────────────────────────────────────────
+# ── Background worker ──────────────────────────────────────────────────────
 
-def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int, channels: int) -> bytes:
-    """Wrap raw 16-bit signed PCM bytes into a valid RIFF/WAV container."""
-    data_len = len(pcm_bytes)
-    buf = io.BytesIO()
-    buf.write(b"RIFF")
-    buf.write(struct.pack("<I", 36 + data_len))
-    buf.write(b"WAVE")
-    # fmt chunk
-    buf.write(b"fmt ")
-    buf.write(struct.pack("<I", 16))                        # chunk size
-    buf.write(struct.pack("<H", 1))                         # PCM = 1
-    buf.write(struct.pack("<H", channels))
-    buf.write(struct.pack("<I", sample_rate))
-    buf.write(struct.pack("<I", sample_rate * channels * OUTPUT_SAMPLE_WIDTH))
-    buf.write(struct.pack("<H", channels * OUTPUT_SAMPLE_WIDTH))
-    buf.write(struct.pack("<H", OUTPUT_SAMPLE_WIDTH * 8))   # bits per sample
-    # data chunk
-    buf.write(b"data")
-    buf.write(struct.pack("<I", data_len))
-    buf.write(pcm_bytes)
-    return buf.getvalue()
-
-
-async def _synthesize_speech(text: str, language: str) -> bytes:
+async def _run_tts_job(job_id: str, text: str, language: str, voice: str) -> None:
     """
-    Synthesise *text* using the Microsoft Neural TTS voice for *language*.
+    Background task: runs TTS inference and writes the output to storage.
+    Called by FastAPI BackgroundTasks immediately after /generate returns 202.
 
-    Returns the audio as a WAV (RIFF/PCM) byte string.
-    Raises HTTPException(503) when the TTS service is unreachable.
-    Raises HTTPException(502) on any other synthesis failure.
+    State machine:
+      QUEUED → PROCESSING → COMPLETED
+                          → FAILED
     """
-    config = LANGUAGE_CONFIG[language]
-    voice  = config["voice"]
-    logger.info("TTS request: lang=%s voice=%s text_len=%d", language, voice, len(text))
+    logger.info("Worker START  job_id=%s", job_id)
 
-    # ── Stream audio chunks from edge-tts ─────────────────────────────────
+    # Transition: QUEUED → PROCESSING
     try:
-        communicate = edge_tts.Communicate(text, voice)
-        audio_chunks: list[bytes] = []
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio_chunks.append(chunk["data"])
-    except edge_tts.exceptions.NoAudioReceived:
-        logger.error("edge-tts returned no audio for lang=%s", language)
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"TTS returned no audio for language '{language}'. "
-                "The text may be too short or contain unsupported characters."
-            ),
-        )
-    except Exception as exc:
-        logger.error("edge-tts error: %s", exc)
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "TTS service is temporarily unavailable. "
-                "edge-tts requires an internet connection to the Microsoft Speech API. "
-                f"Error: {exc}"
-            ),
-        )
+        await job_manager.update_status(job_id, JobStatus.PROCESSING)
+    except KeyError:
+        logger.error("Worker cannot find job_id=%s (already evicted?)", job_id)
+        return
 
-    if not audio_chunks:
-        raise HTTPException(
-            status_code=502,
-            detail="TTS returned empty audio. Please try again.",
-        )
-
-    raw_audio = b"".join(audio_chunks)
-    logger.info("Received %d bytes of raw TTS audio", len(raw_audio))
-
-    # ── Decode MP3/WebM → raw PCM → WAV ───────────────────────────────────
+    # Synthesise
     try:
-        decoded = miniaudio.decode(
-            raw_audio,
-            output_format=miniaudio.SampleFormat.SIGNED16,
-            nchannels=OUTPUT_CHANNELS,
-            sample_rate=OUTPUT_SAMPLE_RATE,
+        result = await tts.synthesise(
+            SynthesisRequest(text=text, language=language, voice=voice)
         )
-        pcm_bytes = bytes(decoded.samples)
-        wav_bytes = _pcm_to_wav(pcm_bytes, decoded.sample_rate, decoded.nchannels)
+    except TTSUnavailableError as exc:
+        logger.error("Worker TTS unavailable  job_id=%s  err=%s", job_id, exc)
+        await job_manager.update_status(
+            job_id, JobStatus.FAILED,
+            error_message=f"TTS service unavailable: {exc}",
+        )
+        return
+    except TTSNoAudioError as exc:
+        logger.error("Worker TTS no audio  job_id=%s  err=%s", job_id, exc)
+        await job_manager.update_status(
+            job_id, JobStatus.FAILED,
+            error_message=f"TTS returned no audio: {exc}",
+        )
+        return
+    except TTSProviderError as exc:
+        logger.error("Worker TTS error  job_id=%s  err=%s", job_id, exc)
+        await job_manager.update_status(
+            job_id, JobStatus.FAILED,
+            error_message=f"TTS provider error: {exc}",
+        )
+        return
     except Exception as exc:
-        logger.error("Audio decode/conversion error: %s", exc)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to convert TTS audio to WAV: {exc}",
+        logger.exception("Worker unexpected error  job_id=%s", job_id)
+        await job_manager.update_status(
+            job_id, JobStatus.FAILED,
+            error_message=f"Unexpected error: {exc}",
         )
+        return
 
-    duration = len(pcm_bytes) / (decoded.sample_rate * decoded.nchannels * OUTPUT_SAMPLE_WIDTH)
-    logger.info(
-        "WAV ready: %d bytes, %.2fs, %dHz %dch",
-        len(wav_bytes), duration, decoded.sample_rate, decoded.nchannels,
+    # Persist output
+    output_key = f"outputs/{job_id}_output.wav"
+    try:
+        await storage.put(output_key, result.wav_bytes, content_type="audio/wav")
+        output_url = await storage.presign_url(output_key, ttl_seconds=3600)
+    except Exception as exc:
+        logger.exception("Worker storage error  job_id=%s", job_id)
+        await job_manager.update_status(
+            job_id, JobStatus.FAILED,
+            error_message=f"Storage write failed: {exc}",
+        )
+        return
+
+    # Transition: PROCESSING → COMPLETED
+    await job_manager.update_status(
+        job_id, JobStatus.COMPLETED,
+        output_key=output_key,
+        output_url=output_url,
     )
-    return wav_bytes
+    logger.info(
+        "Worker DONE  job_id=%s  wav=%d bytes  duration=%.2fs",
+        job_id, len(result.wav_bytes), result.duration_s,
+    )
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────
@@ -198,60 +199,70 @@ async def _synthesize_speech(text: str, language: str) -> bytes:
 @app.get("/", tags=["System"], include_in_schema=False)
 async def root():
     return {
-        "service": "IndicVoice AI API",
-        "version": "2.0.0",
-        "tts_engine": "edge-tts (Microsoft Neural TTS)",
-        "docs": "/docs",
-        "health": "/health",
+        "service":    "IndicVoice AI API",
+        "version":    "3.0.0",
+        "phase":      "4A — Async Job System",
+        "tts_engine": tts.name,
+        "docs":       "/docs",
+        "health":     "/health",
     }
 
 
 @app.get("/health", tags=["System"], summary="Health check")
 async def health():
-    """Returns service status, TTS engine info, and supported languages."""
+    """Returns service status, TTS engine, and supported languages."""
     return {
-        "status": "ok",
-        "service": "IndicVoice AI API",
-        "version": "2.0.0",
-        "tts_engine": "edge-tts (Microsoft Neural TTS)",
+        "status":      "ok",
+        "service":     "IndicVoice AI API",
+        "version":     "3.0.0",
+        "tts_engine":  tts.name,
         "supported_languages": {
             code: {
-                "name":   cfg["name"],
-                "voice":  cfg["voice"],
-                "gender": cfg["gender"],
-                "locale": cfg["locale"],
+                "name":  cfg["name"],
+                "voice": cfg["voice"],
             }
-            for code, cfg in LANGUAGE_CONFIG.items()
+            for code, cfg in SUPPORTED_LANGUAGES.items()
         },
-        "max_upload_mb":     MAX_UPLOAD_BYTES // (1024 * 1024),
-        "accepted_formats":  sorted(ACCEPTED_EXTENSIONS),
-        "output_format":     "WAV (PCM 16-bit, 22050 Hz, mono)",
+        "max_upload_mb":    MAX_UPLOAD_BYTES // (1024 * 1024),
+        "accepted_formats": sorted(ACCEPTED_EXTENSIONS),
+        "output_format":    "WAV (PCM 16-bit, 22050 Hz, mono)",
+        "job_system":       "LocalJobManager (in-memory)",
+        "storage_backend":  "LocalStorageBackend (filesystem)",
     }
 
 
-@app.post("/generate", tags=["Voice"], summary="Generate speech audio")
+@app.post(
+    "/generate",
+    status_code=202,
+    tags=["Voice"],
+    summary="Submit a TTS job (async)",
+    response_description="Job accepted — poll /job/{job_id} for status",
+)
 async def generate(
-    audio:    UploadFile = File(..., description="Voice sample (WAV/MP3/OGG/WEBM/FLAC, max 50 MB)"),
-    text:     str        = Form(..., description="Text to synthesise (1–500 characters)"),
+    background_tasks: BackgroundTasks,
+    audio:    UploadFile = File(...,  description="Voice sample — WAV/MP3/OGG/WEBM/FLAC, max 50 MB"),
+    text:     str        = Form(...,  description="Text to synthesise, 1–500 characters"),
     language: str        = Form("en", description="Language code: te / ta / hi / en"),
 ):
     """
-    Synthesise speech from *text* using the Neural TTS voice for *language*.
+    **Asynchronous** TTS job submission.
 
-    - **audio** – reference voice sample (accepted but not used for cloning in Phase 3A)
-    - **text**  – the text to speak (1–500 characters)
-    - **language** – `te` Telugu · `ta` Tamil · `hi` Hindi · `en` English
+    1. Validates all inputs.
+    2. Saves the uploaded voice sample to storage.
+    3. Creates a job record (status = `queued`).
+    4. Starts a background TTS worker.
+    5. Returns **HTTP 202** with `{ job_id, poll_url }` immediately —
+       the client does not wait for synthesis to finish.
 
-    Returns a `audio/wav` attachment ready for direct browser playback.
+    Poll **GET /job/{job_id}** until `status` is `completed` or `failed`.
+    When `completed`, the response contains `output_url` — a direct link
+    to the generated WAV file.
     """
     # ── Validate language ──────────────────────────────────────────────────
-    if language not in LANGUAGE_CONFIG:
+    if language not in SUPPORTED_LANGUAGES:
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"Unsupported language '{language}'. "
-                f"Accepted values: {list(LANGUAGE_CONFIG.keys())}"
-            ),
+            detail=f"Unsupported language '{language}'. Accepted: {list(SUPPORTED_LANGUAGES)}",
         )
 
     # ── Validate text ──────────────────────────────────────────────────────
@@ -266,53 +277,135 @@ async def generate(
 
     # ── Validate audio upload ──────────────────────────────────────────────
     filename = audio.filename or "upload"
-    ext = Path(filename).suffix.lower()
+    ext      = Path(filename).suffix.lower()
     if ext not in ACCEPTED_EXTENSIONS:
         raise HTTPException(
             status_code=422,
-            detail=f"Unsupported file extension '{ext}'. Accepted: {sorted(ACCEPTED_EXTENSIONS)}",
+            detail=f"Unsupported file type '{ext}'. Accepted: {sorted(ACCEPTED_EXTENSIONS)}",
         )
 
     content = await audio.read()
-    if len(content) == 0:
+    if not content:
         raise HTTPException(status_code=422, detail="Uploaded audio file is empty.")
     if len(content) > MAX_UPLOAD_BYTES:
         mb = len(content) / 1024 / 1024
         raise HTTPException(
             status_code=413,
-            detail=(
-                f"File too large ({mb:.1f} MB). "
-                f"Maximum allowed: {MAX_UPLOAD_BYTES // (1024 * 1024)} MB."
-            ),
+            detail=f"File too large ({mb:.1f} MB). Max: {MAX_UPLOAD_BYTES//(1024*1024)} MB.",
         )
 
-    # ── Save uploaded sample ───────────────────────────────────────────────
-    job_id      = uuid.uuid4().hex
-    upload_path = UPLOADS_DIR / f"{job_id}_sample{ext}"
-    with open(upload_path, "wb") as f:
-        f.write(content)
-    logger.info("Saved upload: %s (%d bytes)", upload_path.name, len(content))
+    # ── Persist upload ─────────────────────────────────────────────────────
+    job_id     = uuid.uuid4().hex
+    upload_key = f"uploads/{job_id}_sample{ext}"
+    await storage.put(upload_key, content)
+    logger.info("Upload saved  key=%s  size=%d", upload_key, len(content))
 
-    # ── Synthesise speech ──────────────────────────────────────────────────
-    wav_bytes = await _synthesize_speech(text, language)
+    # ── Create job ─────────────────────────────────────────────────────────
+    cfg  = SUPPORTED_LANGUAGES[language]
+    meta = JobMeta(
+        language=language,
+        text=text,
+        voice=cfg["voice"],
+        upload_key=upload_key,
+        sample_size_b=len(content),
+    )
+    job = await job_manager.create_job(meta)
 
-    # ── Persist output ─────────────────────────────────────────────────────
-    output_path = OUTPUTS_DIR / f"{job_id}_output.wav"
-    with open(output_path, "wb") as f:
-        f.write(wav_bytes)
-    logger.info("Saved output: %s (%d bytes)", output_path.name, len(wav_bytes))
+    # ── Enqueue background worker ──────────────────────────────────────────
+    background_tasks.add_task(
+        _run_tts_job,
+        job_id=job.id,
+        text=text,
+        language=language,
+        voice=cfg["voice"],
+    )
 
-    # ── Return WAV ─────────────────────────────────────────────────────────
-    cfg = LANGUAGE_CONFIG[language]
-    return Response(
-        content=wav_bytes,
-        media_type="audio/wav",
+    logger.info("Job enqueued  job_id=%s  lang=%s  text_len=%d", job.id, language, len(text))
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id":   job.id,
+            "status":   job.status.value,
+            "poll_url": f"/job/{job.id}",
+            "message":  "Job accepted. Poll poll_url for status.",
+        },
         headers={
-            "Content-Disposition":            f'attachment; filename="indicvoice_{language}_{job_id[:8]}.wav"',
-            "X-Job-Id":                       job_id,
-            "X-Language":                     cfg["name"],
-            "X-Voice":                        cfg["voice"],
-            "X-Text-Len":                     str(len(text)),
-            "Access-Control-Expose-Headers":  "X-Job-Id, X-Language, X-Voice, X-Text-Len",
+            "Location":   f"/job/{job.id}",
+            "X-Job-Id":   job.id,
+            "Retry-After": "2",
         },
     )
+
+
+@app.get(
+    "/job/{job_id}",
+    tags=["Voice"],
+    summary="Get job status",
+)
+async def get_job(job_id: str):
+    """
+    Return the current status of a TTS job.
+
+    | status       | meaning                                           |
+    |------------- |---------------------------------------------------|
+    | `queued`     | Job created, waiting for a worker                 |
+    | `processing` | TTS inference is running                          |
+    | `completed`  | WAV is ready — `output_url` is populated          |
+    | `failed`     | Unrecoverable error — `error_message` explains why|
+
+    When `status == completed`, fetch or play the audio at `output_url`.
+    """
+    job = await job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job '{job_id}' not found. It may have expired (TTL 8h) or never existed.",
+        )
+    return job.to_dict()
+
+
+@app.delete(
+    "/job/{job_id}",
+    tags=["Voice"],
+    summary="Delete a job and its output (GDPR erasure)",
+)
+async def delete_job(job_id: str):
+    """
+    Remove a job record and its associated storage objects.
+    Useful for GDPR right-to-erasure requests and manual cleanup.
+    Returns 404 if the job does not exist.
+    """
+    job = await job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    # Delete storage blobs
+    if job.output_key:
+        await storage.delete(job.output_key)
+    if job.meta and job.meta.upload_key:
+        await storage.delete(job.meta.upload_key)
+
+    # Delete job record
+    await job_manager.delete_job(job_id)
+
+    logger.info("Job deleted (GDPR)  job_id=%s", job_id)
+    return {"deleted": True, "job_id": job_id}
+
+
+@app.get(
+    "/jobs",
+    tags=["Voice"],
+    summary="List recent jobs (dev/debug)",
+)
+async def list_jobs(limit: int = 20):
+    """
+    Return the most recent *limit* jobs (newest first).
+    Intended for local development and debugging.
+    Remove or auth-gate this endpoint before production.
+    """
+    jobs = await job_manager.list_jobs(limit=min(limit, 100))
+    return {
+        "count": len(jobs),
+        "jobs":  [j.to_dict() for j in jobs],
+    }
