@@ -1,4 +1,16 @@
+# IndicVoice AI — Backend dependencies
+# Install: pip install -r requirements.txt
+
+# Web framework
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 aiofiles==23.2.1
+
+# TTS engine — Microsoft Neural TTS (online, no model download required)
+# Requires internet access to speech.platform.bing.com
+edge-tts>=6.1.9
+
+# Audio decode/conversion — pure Python, no ffmpeg required
+# Converts edge-tts MP3/WebM output → 16-bit PCM WAV
+miniaudio>=1.71
