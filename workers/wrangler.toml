@@ -1,0 +1,51 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Indic Voice AI — Cloudflare Workers configuration
+# Phase 6: API Gateway with R2 + KV bindings
+# ─────────────────────────────────────────────────────────────────────────────
+
+name               = "indic-voice-workers"
+main               = "index.ts"
+compatibility_date = "2024-01-01"
+node_compat        = false
+
+# ── Static variables (override secrets in CF dashboard, NOT here) ─────────────
+[vars]
+# Base URL of your FastAPI backend (Railway / Render / Modal / local)
+# For production, set this via: wrangler secret put BACKEND_URL
+BACKEND_URL    = "https://your-backend.example.com"
+WORKER_VERSION = "6.0.0"
+
+# ── R2 Storage binding ────────────────────────────────────────────────────────
+# Create bucket first: wrangler r2 bucket create indic-voice-audio
+[[r2_buckets]]
+binding     = "AUDIO_BUCKET"
+bucket_name = "indic-voice-audio"
+
+# ── KV Namespace binding ──────────────────────────────────────────────────────
+# Create namespace first: wrangler kv namespace create indic-voice-jobs
+# Then paste the id values returned by the CLI into the fields below.
+[[kv_namespaces]]
+binding    = "JOB_STORE"
+id         = "REPLACE_WITH_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_KV_PREVIEW_NAMESPACE_ID"
+
+# ── Local development ─────────────────────────────────────────────────────────
+[dev]
+port           = 8787
+local_protocol = "http"
+ip             = "127.0.0.1"
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+[build]
+command = "npm run type-check"
+
+# ── Production environment overrides ─────────────────────────────────────────
+[env.production]
+name = "indic-voice-workers"
+# Uncomment and fill in after domain is configured in CF dashboard:
+# route = { pattern = "api.your-domain.com/*", zone_name = "your-domain.com" }
+
+[env.production.vars]
+WORKER_VERSION = "6.0.0"
+# BACKEND_URL — set as encrypted secret in CF dashboard:
+#   wrangler secret put BACKEND_URL --env production
