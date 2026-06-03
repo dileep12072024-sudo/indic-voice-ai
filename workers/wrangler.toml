@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Indic Voice AI — Cloudflare Workers configuration
-# Phase 6: API Gateway with R2 + KV bindings
+# Phase 7: Security hardening — API key auth + per-IP rate limiting
 # ─────────────────────────────────────────────────────────────────────────────
 
 name               = "indic-voice-workers"
@@ -8,12 +8,25 @@ main               = "index.ts"
 compatibility_date = "2024-01-01"
 node_compat        = false
 
-# ── Static variables (override secrets in CF dashboard, NOT here) ─────────────
+# ── Static variables ──────────────────────────────────────────────────────────
+# Secrets (BACKEND_URL, WORKER_API_KEY) must NOT be set here.
+# Use:  wrangler secret put BACKEND_URL
+#       wrangler secret put WORKER_API_KEY
 [vars]
-# Base URL of your FastAPI backend (Railway / Render / Modal / local)
-# For production, set this via: wrangler secret put BACKEND_URL
-BACKEND_URL    = "https://your-backend.example.com"
-WORKER_VERSION = "6.0.0"
+WORKER_VERSION = "7.0.0"
+
+# Comma-separated list of allowed CORS origins.
+# Use "*" for local dev; restrict to your Pages domain in production.
+# Example: "https://indic-voice.pages.dev,https://your-domain.com"
+ALLOWED_ORIGINS = "*"
+
+# Rate-limit parameters (override in CF dashboard or [env.production.vars])
+RATE_LIMIT_REQUESTS        = "20"   # max requests per IP per window
+RATE_LIMIT_WINDOW_SECONDS  = "60"   # sliding-window size in seconds
+
+# ── Encrypted secrets (set via CLI, never in this file) ───────────────────────
+# wrangler secret put BACKEND_URL
+# wrangler secret put WORKER_API_KEY
 
 # ── R2 Storage binding ────────────────────────────────────────────────────────
 # Create bucket first: wrangler r2 bucket create indic-voice-audio
@@ -21,13 +34,22 @@ WORKER_VERSION = "6.0.0"
 binding     = "AUDIO_BUCKET"
 bucket_name = "indic-voice-audio"
 
-# ── KV Namespace binding ──────────────────────────────────────────────────────
-# Create namespace first: wrangler kv namespace create indic-voice-jobs
-# Then paste the id values returned by the CLI into the fields below.
+# ── KV Namespace — job state ──────────────────────────────────────────────────
+# Create: wrangler kv namespace create indic-voice-jobs
+# Then paste the id values returned by the CLI below.
 [[kv_namespaces]]
 binding    = "JOB_STORE"
-id         = "REPLACE_WITH_KV_NAMESPACE_ID"
-preview_id = "REPLACE_WITH_KV_PREVIEW_NAMESPACE_ID"
+id         = "REPLACE_WITH_KV_JOB_STORE_ID"
+preview_id = "REPLACE_WITH_KV_JOB_STORE_PREVIEW_ID"
+
+# ── KV Namespace — rate-limit counters ───────────────────────────────────────
+# Separate namespace keeps rate-limit TTLs isolated from job records.
+# Create: wrangler kv namespace create indic-voice-ratelimit
+# Then paste the id values returned by the CLI below.
+[[kv_namespaces]]
+binding    = "RATE_LIMITER"
+id         = "REPLACE_WITH_KV_RATELIMIT_ID"
+preview_id = "REPLACE_WITH_KV_RATELIMIT_PREVIEW_ID"
 
 # ── Local development ─────────────────────────────────────────────────────────
 [dev]
@@ -46,6 +68,10 @@ name = "indic-voice-workers"
 # route = { pattern = "api.your-domain.com/*", zone_name = "your-domain.com" }
 
 [env.production.vars]
-WORKER_VERSION = "6.0.0"
-# BACKEND_URL — set as encrypted secret in CF dashboard:
-#   wrangler secret put BACKEND_URL --env production
+WORKER_VERSION            = "7.0.0"
+ALLOWED_ORIGINS           = "https://indic-voice.pages.dev"   # restrict in prod
+RATE_LIMIT_REQUESTS       = "20"
+RATE_LIMIT_WINDOW_SECONDS = "60"
+# Secrets for production — set via:
+#   wrangler secret put BACKEND_URL      --env production
+#   wrangler secret put WORKER_API_KEY   --env production
