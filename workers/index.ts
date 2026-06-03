@@ -1,8 +1,8 @@
 /**
  * Indic Voice AI — Cloudflare Workers API Gateway
- * Phase 7: Security hardening
+ * Phase 8: Bug-fix release — restore all template literal interpolations
  *
- * New in v7:
+ * Phase 7 feature set (unchanged):
  *   - API key authentication via X-Api-Key header (WORKER_API_KEY secret)
  *   - Per-IP sliding-window rate limiting via KV (RATE_LIMITER namespace)
  *   - Security response headers (CSP, HSTS, X-Frame-Options, etc.)
@@ -313,7 +313,7 @@ async function checkRateLimit(
 
   // Sanitise IP for use as a KV key
   const safeIp = clientIp.replace(/[^a-zA-Z0-9.:_-]/g, "_").slice(0, 64);
-  const kvKey = `rl:${safeIp}:${windowIndex}`;
+  const kvKey = `rl::${safeIp}::${windowIndex}`;
 
   if (!env.RATE_LIMITER) {
     console.warn(
@@ -371,7 +371,7 @@ function rateLimitHeaders(
 async function handleHealth(env: Env, requestId: string): Promise<Response> {
   const body: HealthResponse = {
     status: "ok",
-    version: env.WORKER_VERSION ?? "7.0.0",
+    version: env.WORKER_VERSION ?? "8.0.0",
     timestamp: new Date().toISOString(),
     bindings: {
       r2: typeof env.AUDIO_BUCKET !== "undefined",
@@ -387,7 +387,7 @@ async function handleHealth(env: Env, requestId: string): Promise<Response> {
 
 /**
  * POST /generate
- * Accepts JSON { text, language, voice?, mode? }
+ * Accepts multipart/form-data { audio, text, language, mode? }
  * Forwards to FastAPI backend and returns job_id immediately (202 Accepted).
  */
 async function handleGenerate(
@@ -396,18 +396,43 @@ async function handleGenerate(
   ctx: ExecutionContext,
   requestId: string
 ): Promise<Response> {
-  let body: GenerateRequest;
-  try {
-    body = (await request.json()) as GenerateRequest;
-  } catch {
-    return errorResponse("Invalid JSON body", "INVALID_JSON", 400, {
-      "X-Request-Id": requestId,
-    });
+  // Accept both JSON and multipart/form-data (frontend sends FormData)
+  const contentType = request.headers.get("Content-Type") ?? "";
+  let text: string | null = null;
+  let language: string | null = null;
+  let voice: string | null = null;
+  let mode: string = "standard";
+  let bodyToForward: BodyInit;
+  let forwardContentType: string | null = null;
+
+  if (contentType.includes("multipart/form-data")) {
+    // Forward the raw FormData to FastAPI
+    const formData = await request.formData();
+    text = formData.get("text") as string | null;
+    language = formData.get("language") as string | null;
+    voice = formData.get("voice") as string | null;
+    mode = (formData.get("mode") as string) ?? "standard";
+    bodyToForward = formData;
+    // Let fetch set the correct boundary automatically (no explicit Content-Type)
+  } else {
+    // Assume JSON
+    let body: GenerateRequest;
+    try {
+      body = (await request.json()) as GenerateRequest;
+    } catch {
+      return errorResponse("Invalid JSON body", "INVALID_JSON", 400, {
+        "X-Request-Id": requestId,
+      });
+    }
+    text = body.text ?? null;
+    language = body.language ?? null;
+    voice = body.voice ?? null;
+    mode = body.mode ?? "standard";
+    bodyToForward = JSON.stringify({ text, language, voice, mode });
+    forwardContentType = "application/json";
   }
 
-  const { text, language, voice, mode = "standard" } = body;
-
-  if (!text || typeof text !== "string" || text.trim().length === 0) {
+  if (!text || text.trim().length === 0) {
     return errorResponse(
       "'text' is required and must be a non-empty string",
       "MISSING_TEXT",
@@ -454,21 +479,20 @@ async function handleGenerate(
     );
   }
 
+  const forwardHeaders: Record<string, string> = {
+    "X-Forwarded-By": "cf-worker",
+    "X-Request-Id": requestId,
+  };
+  if (forwardContentType) {
+    forwardHeaders["Content-Type"] = forwardContentType;
+  }
+
   let backendResponse: Response;
   try {
     backendResponse = await fetch(`${backendUrl}/generate`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Forwarded-By": "cf-worker",
-        "X-Request-Id": requestId,
-      },
-      body: JSON.stringify({
-        text: text.trim(),
-        language,
-        voice: voice ?? null,
-        mode,
-      }),
+      headers: forwardHeaders,
+      body: bodyToForward,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown network error";
@@ -513,7 +537,7 @@ async function handleGenerate(
       language,
       text: text.trim().slice(0, 200),
       voice: (voice as string) ?? "",
-      mode,
+      mode: mode as "standard" | "clone",
       output_key: null,
       output_url: null,
       error_message: null,
@@ -529,13 +553,13 @@ async function handleGenerate(
   }
 
   console.log(
-    `[Worker][${requestId}] Job created: ${jobId} lang=${language} mode=${mode}`
+    `[Worker][${requestId}] Job created: job_id=${jobId} lang=${language} mode=${mode}`
   );
 
   return jsonResponse(
     {
       ...jobData,
-      worker_version: env.WORKER_VERSION ?? "7.0.0",
+      worker_version: env.WORKER_VERSION ?? "8.0.0",
       gateway: "cloudflare-workers",
       request_id: requestId,
     },
