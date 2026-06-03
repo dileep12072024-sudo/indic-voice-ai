@@ -20,7 +20,7 @@ const MODES = [
     id:    'clone',
     label: 'Voice Clone',
     icon:  '🧬',
-    desc:  'OpenVoice v2 — transfers your voice\'s tone colour onto the synthesis. Requires GPU backend.',
+    desc:  "OpenVoice v2 — transfers your voice's tone colour onto the synthesis. Requires GPU backend.",
   },
 ]
 
@@ -38,19 +38,39 @@ function validateFile(file) {
     return `File too large. Max size is ${MAX_SIZE_MB} MB (got ${(file.size / 1024 / 1024).toFixed(1)} MB).`
   const typeOk = ACCEPTED_TYPES.includes(file.type) || ACCEPTED_EXT.test(file.name)
   if (!typeOk)
-    return `Unsupported format "${file.name.split('.').pop()}". Please upload WAV, MP3, OGG, WEBM, or FLAC.`
+    return `Unsupported format "${file.name}". Please upload WAV, MP3, OGG, WEBM, or FLAC.`
   return null
 }
 
-// Resolve API base: Vite proxy in dev, or VITE_API_BASE in production
-const API_BASE = import.meta.env.VITE_API_BASE ?? ''
+// ── API base resolution ────────────────────────────────────────────────────
+// In production:  VITE_WORKERS_URL  -> CF Workers gateway (preferred)
+// Fallback:       VITE_API_BASE     -> direct backend or Vite proxy
+// Dev:            empty string      -> Vite proxy (vite.config.js)
+const WORKERS_URL = (import.meta.env.VITE_WORKERS_URL ?? '').replace(/\/+$/, '')
+const API_BASE    = (import.meta.env.VITE_API_BASE    ?? '').replace(/\/+$/, '')
+const BASE_URL    = WORKERS_URL || API_BASE  // prefer Workers URL
+
+// API key for Workers gateway auth (Phase 7 / Phase 8)
+// Set VITE_WORKER_API_KEY in your .env or CF Pages environment variables.
+const WORKER_API_KEY = import.meta.env.VITE_WORKER_API_KEY ?? ''
+
+/** Build fetch headers — always include X-Api-Key when key is configured */
+function apiHeaders(extra = {}) {
+  const headers = { ...extra }
+  if (WORKER_API_KEY) {
+    headers['X-Api-Key'] = WORKER_API_KEY
+  }
+  return headers
+}
 
 // ── Async job polling helper ───────────────────────────────────────────────
 async function pollJobUntilDone(jobId, onProgress) {
   const deadline = Date.now() + POLL_TIMEOUT
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, POLL_INTERVAL))
-    const res  = await fetch(`${API_BASE}/job/${jobId}`)
+    const res  = await fetch(`${BASE_URL}/job/${jobId}`, {
+      headers: apiHeaders(),
+    })
     if (!res.ok) throw new Error(`Poll error ${res.status}`)
     const data = await res.json()
     onProgress(data.status)
@@ -110,15 +130,20 @@ export default function VoiceCloner() {
     form.append('audio',    audioFile)
     form.append('text',     text.trim())
     form.append('language', language)
-    form.append('mode',     mode)                // Phase 4B: pass mode
+    form.append('mode',     mode)
 
     try {
       // Step 1 — submit job (expect 202)
-      const res = await fetch(`${API_BASE}/generate`, { method: 'POST', body: form })
+      // Do NOT set Content-Type — browser must set it with correct multipart boundary
+      const res = await fetch(`${BASE_URL}/generate`, {
+        method:  'POST',
+        headers: apiHeaders(), // X-Api-Key only; no Content-Type override
+        body:    form,
+      })
 
       if (!res.ok) {
         let detail = `Server error ${res.status}`
-        try { const d = await res.json(); detail = d.detail ?? detail } catch (_) {}
+        try { const d = await res.json(); detail = d.detail ?? d.error ?? detail } catch (_) {}
         throw new Error(detail)
       }
 
@@ -137,7 +162,10 @@ export default function VoiceCloner() {
       if (!completed.output_url) throw new Error('Job completed but no output URL returned.')
 
       // Step 3 — fetch WAV and create blob URL
-      const wavRes  = await fetch(`${API_BASE}${completed.output_url}`)
+      const outputHref = completed.output_url.startsWith('http')
+        ? completed.output_url
+        : `${BASE_URL}${completed.output_url}`
+      const wavRes  = await fetch(outputHref, { headers: apiHeaders() })
       if (!wavRes.ok) throw new Error(`Could not fetch output audio (${wavRes.status}).`)
       const blob    = await wavRes.blob()
       if (blob.size === 0) throw new Error('Server returned an empty audio file.')
@@ -147,8 +175,9 @@ export default function VoiceCloner() {
       setPollStatus('completed')
 
     } catch (err) {
+      const target = WORKERS_URL || 'port 8000'
       const msg = err.message === 'Failed to fetch'
-        ? 'Cannot reach the backend. Make sure FastAPI is running on port 8000.'
+        ? `Cannot reach the backend. Make sure the server is running at ${target}.`
         : err.message
       setErrorMsg(msg)
       setStatus('error')
@@ -348,7 +377,7 @@ export default function VoiceCloner() {
         </div>
         <div className="flex justify-between mt-1">
           <span className="text-xs text-slate-600">Max 500 characters</span>
-          <span className={`text-xs ${text.length > 450 ? 'text-amber-400' : 'text-slate-600'}`}>
+          <span className={`text-xs ${text.length > 450 ? 'text-amber-400' : 'text-slate-500'}`}>
             {text.length} / 500
           </span>
         </div>
