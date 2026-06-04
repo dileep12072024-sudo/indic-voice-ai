@@ -11,7 +11,8 @@ New in Phase 4B:
                              models are not installed / enabled.
 
   GET  /health   → now reports cloning_available flag.
-  GET  /job/{id} → job.meta carries the mode that was used.
+  GET  /job/{id} → job.meta carries the mode that was used
+                   and cloning_applied (True only if OpenVoice ran).
 
 Architecture:
   All TTS logic is isolated behind the TTSProvider interface.
@@ -73,7 +74,6 @@ job_manager  = LocalJobManager()
 storage      = LocalStorageBackend(base_dir=STORAGE_DIR, serve_prefix="/files")
 _edge_tts    = EdgeTTSProvider()   # default / fallback provider
 
-
 # ── Lifespan ────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -84,7 +84,6 @@ async def lifespan(app: FastAPI):
     )
     yield
     logger.info("IndicVoice AI API shutting down")
-
 
 # ── App ────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -121,7 +120,6 @@ app.add_middleware(
 # ── Static-file serving (local dev) ───────────────────────────────────────
 app.mount("/files", StaticFiles(directory=str(STORAGE_DIR)), name="files")
 
-
 # ── Validation constants ───────────────────────────────────────────────────
 SUPPORTED_LANGUAGES: dict[str, dict] = {
     "te": {"name": "Telugu",  "voice": "te-IN-ShrutiNeural"},
@@ -133,7 +131,6 @@ SUPPORTED_MODES     = {"standard", "clone"}
 MAX_UPLOAD_BYTES    = 50 * 1024 * 1024
 ACCEPTED_EXTENSIONS = {".wav", ".mp3", ".ogg", ".webm", ".flac"}
 
-
 # ── Background worker ──────────────────────────────────────────────────────
 
 async def _run_tts_job(
@@ -142,6 +139,7 @@ async def _run_tts_job(
     language: str,
     voice:    str,
     provider: TTSProvider,
+    mode:     str,           # BUG-2 FIX: passed in so we can write it back to meta
 ) -> None:
     """
     Background task: runs TTS/voice-cloning inference and writes output.
@@ -154,7 +152,7 @@ async def _run_tts_job(
     (either EdgeTTSProvider or OpenVoiceProvider).  The worker never
     imports a concrete provider — it only calls provider.synthesise().
     """
-    logger.info("Worker START  job_id=%s  provider=%s", job_id, provider.name)
+    logger.info("Worker START  job_id=%s  provider=%s  mode=%s", job_id, provider.name, mode)
 
     # Transition: QUEUED → PROCESSING
     try:
@@ -197,6 +195,11 @@ async def _run_tts_job(
         )
         return
 
+    # BUG-2 FIX: determine whether real cloning was applied.
+    # OpenVoiceProvider sets result.cloning_applied when it runs the real
+    # ToneColorConverter; for all other providers it stays False.
+    cloning_applied: bool = getattr(result, "cloning_applied", False)
+
     # Persist output
     output_key = f"outputs/{job_id}_output.wav"
     try:
@@ -210,6 +213,12 @@ async def _run_tts_job(
         )
         return
 
+    # BUG-2 FIX: write cloning_applied back to the job's meta so
+    # GET /job/{id} exposes it and the frontend can show real-vs-fallback.
+    job = await job_manager.get_job(job_id)
+    if job and job.meta:
+        job.meta.cloning_applied = cloning_applied
+
     # Transition: PROCESSING → COMPLETED
     await job_manager.update_status(
         job_id, JobStatus.COMPLETED,
@@ -217,10 +226,11 @@ async def _run_tts_job(
         output_url=output_url,
     )
     logger.info(
-        "Worker DONE  job_id=%s  provider=%s  wav=%d bytes  duration=%.2fs",
-        job_id, provider.name, len(result.wav_bytes), result.duration_s,
+        "Worker DONE  job_id=%s  provider=%s  mode=%s  cloning_applied=%s  "
+        "wav=%d bytes  duration=%.2fs",
+        job_id, provider.name, mode, cloning_applied,
+        len(result.wav_bytes), result.duration_s,
     )
-
 
 # ── Routes ─────────────────────────────────────────────────────────────────
 
@@ -234,7 +244,6 @@ async def root():
         "docs":              "/docs",
         "health":            "/health",
     }
-
 
 @app.get("/health", tags=["System"], summary="Health check")
 async def health():
@@ -261,7 +270,6 @@ async def health():
         "storage_backend":  "LocalStorageBackend (filesystem)",
     }
 
-
 @app.post(
     "/generate",
     status_code=202,
@@ -271,10 +279,10 @@ async def health():
 )
 async def generate(
     background_tasks: BackgroundTasks,
-    audio:    UploadFile = File(...,       description="Voice sample — WAV/MP3/OGG/WEBM/FLAC, max 50 MB"),
-    text:     str        = Form(...,       description="Text to synthesise, 1–500 characters"),
-    language: str        = Form("en",      description="Language code: te / ta / hi / en"),
-    mode:     str        = Form("standard",description="Mode: 'standard' (EdgeTTS) | 'clone' (OpenVoice v2)"),
+    audio:    UploadFile = File(...,        description="Voice sample — WAV/MP3/OGG/WEBM/FLAC, max 50 MB"),
+    text:     str        = Form(...,        description="Text to synthesise, 1–500 characters"),
+    language: str        = Form("en",       description="Language code: te / ta / hi / en"),
+    mode:     str        = Form("standard", description="Mode: 'standard' (EdgeTTS) | 'clone' (OpenVoice v2)"),
 ):
     """
     **Asynchronous** TTS / voice-cloning job submission.
@@ -285,8 +293,7 @@ async def generate(
     * **clone**    — OpenVoice v2 tone-colour transfer
       * Requires `OPENVOICE_ENABLED=true` + checkpoints installed.
       * When OpenVoice is unavailable the job still completes using
-        EdgeTTS; the `cloning_applied` field in the job record will
-        be `false`.
+        EdgeTTS; `cloning_applied` in the job record will be `false`.
 
     Flow
     ────
@@ -297,7 +304,7 @@ async def generate(
     5. Returns **HTTP 202** with `{ job_id, mode, poll_url }` immediately.
 
     Poll **GET /job/{job_id}** until `status` is `completed` or `failed`.
-    When `completed`, the response contains `output_url`.
+    When `completed`, the response contains `output_url` and `cloning_applied`.
     """
     # ── Validate language ──────────────────────────────────────────────────
     if language not in SUPPORTED_LANGUAGES:
@@ -362,12 +369,15 @@ async def generate(
 
     # ── Create job ─────────────────────────────────────────────────────────
     cfg  = SUPPORTED_LANGUAGES[language]
+    # BUG-2 FIX: store mode in JobMeta so GET /job/:id can report it
     meta = JobMeta(
         language=language,
         text=text,
         voice=cfg["voice"],
         upload_key=upload_key,
         sample_size_b=len(content),
+        mode=mode,                  # NEW
+        cloning_applied=False,      # NEW — updated by worker after inference
     )
     job = await job_manager.create_job(meta)
 
@@ -379,6 +389,7 @@ async def generate(
         language=language,
         voice=cfg["voice"],
         provider=provider,
+        mode=mode,          # BUG-2 FIX: pass mode to worker
     )
 
     logger.info(
@@ -404,7 +415,6 @@ async def generate(
         },
     )
 
-
 @app.get(
     "/job/{job_id}",
     tags=["Voice"],
@@ -422,6 +432,8 @@ async def get_job(job_id: str):
     | `failed`     | Unrecoverable error — `error_message` explains why|
 
     When `status == completed`, fetch or play the audio at `output_url`.
+    The `cloning_applied` field is `true` only when OpenVoice v2 actually ran
+    (i.e. `OPENVOICE_ENABLED=true` + models loaded + inference succeeded).
     """
     job = await job_manager.get_job(job_id)
     if job is None:
@@ -430,7 +442,6 @@ async def get_job(job_id: str):
             detail=f"Job '{job_id}' not found. It may have expired (TTL 8h) or never existed.",
         )
     return job.to_dict()
-
 
 @app.delete(
     "/job/{job_id}",
@@ -456,7 +467,6 @@ async def delete_job(job_id: str):
 
     logger.info("Job deleted (GDPR)  job_id=%s", job_id)
     return {"deleted": True, "job_id": job_id}
-
 
 @app.get(
     "/jobs",

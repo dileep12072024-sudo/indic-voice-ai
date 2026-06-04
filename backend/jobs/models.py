@@ -29,12 +29,14 @@ class JobMeta:
     Stored alongside the job record so the worker can act without
     re-reading the original HTTP request.
     """
-    language:      str                    # "te" | "ta" | "hi" | "en"
-    text:          str                    # text to synthesise
-    voice:         str                    # provider voice ID
-    upload_key:    str                    # storage key for the input audio sample
-    text_len:      int = 0
-    sample_size_b: int = 0               # uploaded file size in bytes
+    language:         str                    # "te" | "ta" | "hi" | "en"
+    text:             str                    # text to synthesise
+    voice:            str                    # provider voice ID
+    upload_key:       str                    # storage key for the input audio sample
+    mode:             str = "standard"       # BUG-2 FIX: "standard" | "clone"
+    cloning_applied:  bool = False           # BUG-2 FIX: True only when OpenVoice ran
+    text_len:         int = 0
+    sample_size_b:    int = 0               # uploaded file size in bytes
 
     def __post_init__(self) -> None:
         self.text_len = len(self.text)
@@ -67,14 +69,18 @@ class Job:
     def to_dict(self) -> dict:
         """Serialise to a plain dict suitable for JSON responses."""
         return {
-            "job_id":        self.id,
-            "status":        self.status.value,
-            "language":      self.meta.language   if self.meta else None,
-            "voice":         self.meta.voice       if self.meta else None,
-            "text_len":      self.meta.text_len    if self.meta else None,
-            "output_url":    self.output_url,
-            "error_message": self.error_message,
-            "created_at":    self.created_at,
-            "updated_at":    self.updated_at,
-            "completed_at":  self.completed_at,
+            "job_id":           self.id,
+            "status":           self.status.value,
+            "language":         self.meta.language        if self.meta else None,
+            "voice":            self.meta.voice           if self.meta else None,
+            "text_len":         self.meta.text_len        if self.meta else None,
+            # BUG-2 FIX: expose mode and cloning_applied so the frontend
+            # can show whether real OpenVoice cloning ran or EdgeTTS fallback was used.
+            "mode":             self.meta.mode            if self.meta else "standard",
+            "cloning_applied":  self.meta.cloning_applied if self.meta else False,
+            "output_url":       self.output_url,
+            "error_message":    self.error_message,
+            "created_at":       self.created_at,
+            "updated_at":       self.updated_at,
+            "completed_at":     self.completed_at,
         }
