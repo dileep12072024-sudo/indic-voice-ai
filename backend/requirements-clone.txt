@@ -1,0 +1,43 @@
+# backend/requirements-clone.txt
+# ─────────────────────────────────────────────────────────────────────────────
+# Voice cloning dependencies — install AFTER requirements.txt.
+# These are intentionally separated so Standard TTS users do not need PyTorch.
+#
+# Usage:
+#   pip install -r requirements.txt          # Standard TTS only
+#   pip install -r requirements-clone.txt    # Add real voice cloning
+#   python -m unidic download                # MeloTTS language data
+#
+# Then set environment variables before starting the backend:
+#   OPENVOICE_ENABLED=true
+#   OPENVOICE_CHECKPOINT_DIR=~/.cache/openvoice/v2
+#   OPENVOICE_DEVICE=cpu   (or cuda)
+#
+# Checkpoints (~300 MB) must be downloaded separately.
+# See docs/VOICE_CLONING_READINESS.md — Step 3.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── PyTorch (CPU build — remove +cpu suffix for CUDA) ────────────────────────
+# For CUDA 11.8: torch==2.2.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+# For CUDA 12.1: torch==2.2.2+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.2.2+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+torchaudio==2.2.2+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+
+# ── OpenVoice v2 core ─────────────────────────────────────────────────────────
+openvoice @ git+https://github.com/myshell-ai/OpenVoice.git@main
+MeloTTS @ git+https://github.com/myshell-ai/MeloTTS.git@main
+
+# ── Direct imports in openvoice_provider.py ──────────────────────────────────
+soundfile>=0.12.1
+numpy>=1.22.0
+librosa==0.9.1
+
+# ── Transitive requirements pulled by OpenVoice/MeloTTS ──────────────────────
+faster-whisper>=0.9.0      # VAD in se_extractor.get_se()
+wavmark>=0.0.3             # @MyShell audio watermark in ToneColorConverter
+pydub>=0.25.1              # Audio segment manipulation (MeloTTS)
+langid>=1.1.6              # Language detection
+inflect>=7.0.0             # English text normalisation (MeloTTS)
+unidecode>=1.3.7           # Unicode normalisation (MeloTTS)
+eng_to_ipa>=0.0.2          # Phoneme conversion (MeloTTS)
+scipy>=1.9.0               # Signal processing (librosa transitive)
