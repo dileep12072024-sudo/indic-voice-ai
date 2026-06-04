@@ -9,7 +9,7 @@ No Cloudflare account, no OpenVoice, no GPU required for Standard TTS.
 
 | Requirement | Details |
 |-------------|--------|
-| Python 3.10+ | `python3 --version` |
+| Python 3.10+ | `python3 --version` (macOS/Linux) · `python --version` (Windows) |
 | Node.js 18+ | `node --version` |
 | Internet | EdgeTTS calls `speech.platform.bing.com` |
 | GPU / PyTorch | ❌ Not needed for Standard TTS |
@@ -43,7 +43,7 @@ cd indic-voice-ai
 # macOS / Linux
 bash scripts/start-backend.sh
 
-# Windows
+# Windows (Command Prompt or PowerShell)
 scripts\start-backend.bat
 ```
 
@@ -54,13 +54,18 @@ server on **http://localhost:8000**.
 ### Manual steps
 ```bash
 cd backend
-python3 -m venv .venv
+python3 -m venv .venv        # macOS/Linux
+python  -m venv .venv        # Windows
 
 # macOS / Linux
 source .venv/bin/activate
 
-# Windows
+# Windows (Command Prompt)
 .venv\Scripts\activate
+
+# Windows (PowerShell) — if you see an execution-policy error, run first:
+# Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+.venv\Scripts\Activate.ps1
 
 pip install --upgrade pip
 pip install -r requirements.txt
@@ -72,6 +77,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 **Verify the backend is healthy:**
 ```bash
+# macOS / Linux
+curl http://localhost:8000/health
+
+# Windows (PowerShell)
+Invoke-WebRequest http://localhost:8000/health | Select-Object -ExpandProperty Content
+
+# Windows (Command Prompt)
 curl http://localhost:8000/health
 ```
 Expected response:
@@ -104,8 +116,17 @@ does not exist, installs npm dependencies, and starts Vite on
 ### Manual steps
 ```bash
 # 1. Create the .env file (REQUIRED — without this Generate fails silently)
+# macOS / Linux:
 echo "VITE_API_BASE=http://localhost:8000" > frontend/.env
 echo "VITE_DEV_BACKEND=http://localhost:8000" >> frontend/.env
+
+# Windows (Command Prompt):
+echo VITE_API_BASE=http://localhost:8000> frontend\.env
+echo VITE_DEV_BACKEND=http://localhost:8000>> frontend\.env
+
+# Windows (PowerShell):
+Set-Content frontend\.env "VITE_API_BASE=http://localhost:8000"
+Add-Content frontend\.env "VITE_DEV_BACKEND=http://localhost:8000"
 
 # 2. Install and run
 cd frontend
@@ -166,7 +187,15 @@ a browser. It is the fastest way to confirm Standard TTS is fully working.
 ### Prerequisites
 ```bash
 # Activate the backend venv first
-cd backend && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+
+# macOS / Linux:
+cd backend && source .venv/bin/activate
+
+# Windows (Command Prompt):
+cd backend && .venv\Scripts\activate
+
+# Windows (PowerShell):
+cd backend; .venv\Scripts\Activate.ps1
 
 # Install requests (only extra dep the script needs)
 pip install requests
@@ -187,6 +216,9 @@ python scripts/test-standard-tts.py --url http://localhost:8000
 python scripts/test-standard-tts.py --sample /path/to/your/sample.wav
 
 # Save output WAVs to a different directory
+#   Windows:
+python scripts/test-standard-tts.py --out %TEMP%\tts_outputs
+#   macOS/Linux:
 python scripts/test-standard-tts.py --out /tmp/my_outputs
 
 # Change per-job timeout (seconds, default 120)
@@ -215,7 +247,7 @@ Console (all passing):
 [INFO] Output   : /path/to/repo/validation_outputs
 [INFO] Timeout  : 120.0s per job
 ════════════════════════════════════════════════════════════
-STEP 1 — Health check
+STEP 1 -- Health check
 ════════════════════════════════════════════════════════════
 [HEALTH] GET http://localhost:8000/health
   status            : ok
@@ -224,7 +256,7 @@ STEP 1 — Health check
   supported_languages: ['en', 'hi', 'ta', 'te']
 [HEALTH] ✓ PASS
 ════════════════════════════════════════════════════════════
-STEP 2 — Standard TTS jobs (en / te / ta / hi)
+STEP 2 -- Standard TTS jobs (en / te / ta / hi)
 ════════════════════════════════════════════════════════════
 ────────────────────────────────────────────────────────────
 [EN] English
@@ -249,7 +281,7 @@ SUMMARY
   Total: 4   Passed: 4   Failed: 0
 
   ✓ ALL TESTS PASSED
-  Output WAV files are in: validation_outputs/
+  Output WAV files are in: validation_outputs\
 
     en_output.wav  (142 KB)
     te_output.wav  (138 KB)
@@ -278,10 +310,12 @@ Each file is a 16-bit PCM WAV at 22050 Hz, mono. Typical size: 100–200 KB.
 
 ## 8. Common errors
 
+### Cross-platform errors
+
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Cannot connect to backend` | Backend not started | Run `bash scripts/start-backend.sh` first |
-| `[HEALTH] ✗ FAIL — cannot connect` | Backend not running on port 8000 | Start backend, re-run script |
+| `Cannot connect to backend` | Backend not started | Run `bash scripts/start-backend.sh` (macOS/Linux) or `scripts\start-backend.bat` (Windows) |
+| `[HEALTH] FAIL -- cannot connect` | Backend not running on port 8000 | Start backend, re-run script |
 | Job `failed` with `TTS service unavailable` | No internet / firewall blocking port 443 | Check internet; allow outbound HTTPS |
 | Job `failed` with `TTS returned no audio` | EdgeTTS got empty stream from Microsoft | Text may be empty or only punctuation |
 | Generate times out after 2 min | EdgeTTS can't reach `speech.platform.bing.com` | Check firewall / network |
@@ -290,9 +324,20 @@ Each file is a 16-bit PCM WAV at 22050 Hz, mono. Typical size: 100–200 KB.
 | HTTP 422 Unsupported mode | Invalid mode value | Use `standard` or `clone` |
 | HTTP 413 File too large | Sample exceeds 50 MB | Use a smaller file |
 | Clone sounds like default voice | OpenVoice disabled (expected) | See docs/VOICE_CLONING_READINESS.md |
-| Port 8000 already in use | Another process on 8000 | `lsof -i :8000` then kill it |
 | `ModuleNotFoundError: edge_tts` | Deps not installed | `pip install -r requirements.txt` |
 | `ModuleNotFoundError: requests` | Script dep missing | `pip install requests` |
+
+### Windows-specific errors
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `'python' is not recognized` | Python not in PATH | Re-install Python from <https://python.org> and tick **"Add python.exe to PATH"** during setup; or use `py` instead of `python` |
+| `pip install` fails with `error: Microsoft Visual C++ required` | C build tools missing for a package | Run `pip install --only-binary :all: -r requirements.txt`; all 6 Standard TTS packages have pre-built wheels and do not need a compiler |
+| `.bat file is not recognized` | Wrong working directory | Open a terminal at the repo root (`cd path\to\indic-voice-ai`), then run `scripts\start-backend.bat` |
+| `.venv\Scripts\Activate.ps1 cannot be loaded, execution policy` | PowerShell restricts unsigned scripts | Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, then activate again |
+| Port 8000 already in use | Another process on 8000 | Find it: `netstat -ano \| findstr :8000` — note the PID in the last column. Kill it: `taskkill /PID <pid> /F` |
+| WAV file is 0 bytes or missing | EdgeTTS blocked by Windows Defender / corporate firewall | Allow `python.exe` through Windows Defender Firewall → outbound rule for port 443; or try a personal hotspot to verify |
+| `UnicodeDecodeError` or garbled output in cmd.exe | Legacy console code page | Switch to **Windows Terminal** or **PowerShell 7+**; the script auto-reconfigures to UTF-8, but very old consoles may still show ASCII fallback markers (`PASS`/`FAIL` instead of `✓`/`✗`) — this is cosmetic only, results are unaffected |
 
 ---
 
@@ -310,13 +355,13 @@ See **docs/VOICE_CLONING_READINESS.md** for the complete setup guide.
 
 ---
 
-## 10. Exact run commands (quick reference)
+## 10. Exact run commands — macOS / Linux (quick reference)
 
 ```bash
 # ── Terminal 1: Backend ──────────────────────────────────────────────
 cd backend
 python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt    # 6 packages, ~30 seconds
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 # → Running on http://localhost:8000
@@ -335,3 +380,105 @@ cd ..    # back to repo root
 python scripts/test-standard-tts.py
 # → validation_outputs/ contains en/te/ta/hi WAV files
 ```
+
+---
+
+## 11. Windows Quick-Run (Command Prompt or PowerShell)
+
+> **Prerequisites**: Python 3.10+ and Node.js 18+ installed, both added to PATH.
+> Open **Windows Terminal**, **Command Prompt**, or **PowerShell** at the repo root.
+
+```bat
+REM ── Terminal 1: Backend (Command Prompt) ────────────────────────────
+cd backend
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+REM → Running on http://localhost:8000
+```
+
+```powershell
+# ── Terminal 1: Backend (PowerShell alternative) ─────────────────────
+cd backend
+python -m venv .venv
+.venv\Scripts\Activate.ps1      # if blocked: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+# → Running on http://localhost:8000
+```
+
+```bat
+REM ── Terminal 2: Frontend (Command Prompt) ───────────────────────────
+echo VITE_API_BASE=http://localhost:8000> frontend\.env
+echo VITE_DEV_BACKEND=http://localhost:8000>> frontend\.env
+cd frontend
+npm install
+npm run dev
+REM → Running on http://localhost:5173  — open in browser
+```
+
+```bat
+REM ── Terminal 3: Validate Standard TTS (Command Prompt) ──────────────
+REM (backend must already be running in Terminal 1)
+cd backend
+.venv\Scripts\activate
+pip install requests
+cd ..
+python scripts\test-standard-tts.py
+REM → validation_outputs\ will contain en_output.wav  te_output.wav
+REM                                    ta_output.wav  hi_output.wav
+```
+
+```powershell
+# ── Terminal 3: Validate Standard TTS (PowerShell alternative) ───────
+cd backend; .venv\Scripts\Activate.ps1
+pip install requests
+cd ..
+python scripts\test-standard-tts.py
+# → validation_outputs\ will contain en_output.wav  te_output.wav
+#                                     ta_output.wav  hi_output.wav
+```
+
+### Windows validation — expected output
+
+```
+[INFO] Using auto-generated 1-second silence WAV as sample.
+[INFO] Backend  : http://localhost:8000
+[INFO] Output   : C:\path\to\indic-voice-ai\validation_outputs
+[INFO] Timeout  : 120.0s per job
+============================================================
+STEP 1 -- Health check
+============================================================
+[HEALTH] GET http://localhost:8000/health
+  status            : ok
+  tts_engine        : edge-tts
+  cloning_available : False
+  supported_languages: ['en', 'hi', 'ta', 'te']
+[HEALTH] PASS
+============================================================
+STEP 2 -- Standard TTS jobs (en / te / ta / hi)
+============================================================
+------------------------------------------------------------
+[EN] English
+  ...
+[EN] PASS
+...
+============================================================
+SUMMARY
+============================================================
+  en  (English )  PASS
+  te  (Telugu  )  PASS
+  ta  (Tamil   )  PASS
+  hi  (Hindi   )  PASS
+------------------------------------------------------------
+  Total: 4   Passed: 4   Failed: 0
+
+  ALL TESTS PASSED
+  Output WAV files are in: C:\path\to\indic-voice-ai\validation_outputs\
+```
+
+> **Note**: On Windows cmd.exe the separators show as `=` and `-` instead of
+> `═` and `─`, and marks show as `PASS`/`FAIL` instead of `✓`/`✗`.
+> This is cosmetic — results are identical. Use **Windows Terminal** or
+> **PowerShell 7+** to see the full Unicode output.
