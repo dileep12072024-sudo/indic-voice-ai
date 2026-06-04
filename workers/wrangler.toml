@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Indic Voice AI — Cloudflare Workers configuration
-# Phase 7: Security hardening — API key auth + per-IP rate limiting
+# Phase 8: string-concat fix release (template-literal-safe transport)
 # ─────────────────────────────────────────────────────────────────────────────
 
 name               = "indic-voice-workers"
@@ -13,7 +13,7 @@ node_compat        = false
 # Use:  wrangler secret put BACKEND_URL
 #       wrangler secret put WORKER_API_KEY
 [vars]
-WORKER_VERSION = "7.0.0"
+WORKER_VERSION = "8.0.0"
 
 # Comma-separated list of allowed CORS origins.
 # Use "*" for local dev; restrict to your Pages domain in production.
@@ -30,6 +30,7 @@ RATE_LIMIT_WINDOW_SECONDS  = "60"   # sliding-window size in seconds
 
 # ── R2 Storage binding ────────────────────────────────────────────────────────
 # Create bucket first: wrangler r2 bucket create indic-voice-audio
+# (Requires R2 to be enabled in the Cloudflare Dashboard first)
 [[r2_buckets]]
 binding     = "AUDIO_BUCKET"
 bucket_name = "indic-voice-audio"
@@ -64,7 +65,7 @@ name = "indic-voice-workers"
 # route = { pattern = "api.your-domain.com/*", zone_name = "your-domain.com" }
 
 [env.production.vars]
-WORKER_VERSION            = "7.0.0"
+WORKER_VERSION            = "8.0.0"
 ALLOWED_ORIGINS           = "https://indic-voice.pages.dev"   # restrict in prod
 RATE_LIMIT_REQUESTS       = "20"
 RATE_LIMIT_WINDOW_SECONDS = "60"
