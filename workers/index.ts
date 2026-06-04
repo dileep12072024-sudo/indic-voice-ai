@@ -313,7 +313,7 @@ async function checkRateLimit(
 
   // Sanitise IP for use as a KV key
   const safeIp = clientIp.replace(/[^a-zA-Z0-9.:_-]/g, "_").slice(0, 64);
-  const kvKey = `rl::${safeIp}::${windowIndex}`;
+  const kvKey = `rl:${safeIp}:${windowIndex}`;
 
   if (!env.RATE_LIMITER) {
     console.warn(
