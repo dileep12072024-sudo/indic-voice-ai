@@ -1,6 +1,6 @@
 /**
- * Indic Voice AI — Cloudflare Workers API Gateway
- * Phase 8: Bug-fix release — restore all template literal interpolations
+ * Indic Voice AI -- Cloudflare Workers API Gateway
+ * Phase 8: string-concat fix release (template-literal-safe transport)
  *
  * Phase 7 feature set (unchanged):
  *   - API key authentication via X-Api-Key header (WORKER_API_KEY secret)
@@ -11,11 +11,11 @@
  *   - Structured console logging with request context
  *
  * Routes:
- *   GET    /health       → service status (no auth required)
- *   POST   /generate     → proxy TTS job to FastAPI backend (auth required)
- *   GET    /job/:id      → poll job status from KV + R2 (auth required)
- *   DELETE /job/:id      → GDPR erasure (auth required)
- *   OPTIONS *            → CORS preflight (no auth required)
+ *   GET    /health       -> service status (no auth required)
+ *   POST   /generate     -> proxy TTS job to FastAPI backend (auth required)
+ *   GET    /job/:id      -> poll job status from KV + R2 (auth required)
+ *   DELETE /job/:id      -> GDPR erasure (auth required)
+ *   OPTIONS *            -> CORS preflight (no auth required)
  */
 
 import type {
@@ -25,44 +25,30 @@ import type {
   ExportedHandler,
 } from "@cloudflare/workers-types";
 
-// ─── Environment bindings ────────────────────────────────────────────────────
+// --- Environment bindings ---------------------------------------------------
 
 export interface Env {
   /** R2 bucket for audio uploads + outputs */
   AUDIO_BUCKET: R2Bucket;
   /** KV namespace for job state */
   JOB_STORE: KVNamespace;
-  /** KV namespace for rate-limit counters (separate namespace for clean TTL management) */
+  /** KV namespace for rate-limit counters */
   RATE_LIMITER: KVNamespace;
-  /** FastAPI backend base URL (set as encrypted secret via wrangler secret put BACKEND_URL) */
+  /** FastAPI backend base URL */
   BACKEND_URL: string;
   /** Worker version string */
   WORKER_VERSION: string;
-  /**
-   * Shared API key for gateway authentication (set as encrypted secret).
-   * Clients must send: X-Api-Key: <value>
-   * If empty/unset, auth is BYPASSED — set this before going to production.
-   */
+  /** Shared API key for gateway authentication */
   WORKER_API_KEY: string;
-  /**
-   * Comma-separated list of allowed CORS origins.
-   * Example: "https://indic-voice.pages.dev,https://your-domain.com"
-   * Use "*" to allow all origins (development only).
-   */
+  /** Comma-separated list of allowed CORS origins */
   ALLOWED_ORIGINS: string;
-  /**
-   * Maximum requests per IP per window (default: 20).
-   * Set as a plain var in wrangler.toml [vars] or CF dashboard.
-   */
+  /** Maximum requests per IP per window (default: 20) */
   RATE_LIMIT_REQUESTS: string;
-  /**
-   * Sliding window duration in seconds (default: 60).
-   * Set as a plain var in wrangler.toml [vars] or CF dashboard.
-   */
+  /** Sliding window duration in seconds (default: 60) */
   RATE_LIMIT_WINDOW_SECONDS: string;
 }
 
-// ─── Domain types ─────────────────────────────────────────────────────────────
+// --- Domain types -----------------------------------------------------------
 
 export interface JobRecord {
   id: string;
@@ -106,9 +92,8 @@ interface RateLimitRecord {
   window_start: number; // Unix ms
 }
 
-// ─── Security helpers ─────────────────────────────────────────────────────────
+// --- Security helpers -------------------------------------------------------
 
-/** Security response headers added to every non-preflight response */
 function securityHeaders(): Record<string, string> {
   return {
     "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
@@ -124,17 +109,13 @@ function securityHeaders(): Record<string, string> {
 
 /** Generate a compact unique request ID */
 function newRequestId(): string {
-  const ts = Date.now().toString(36);
+  const ts   = Date.now().toString(36);
   const rand = Math.random().toString(36).slice(2, 8);
-  return `req_${ts}_${rand}`;
+  return "req_" + ts + "_" + rand;
 }
 
-// ─── CORS helpers ─────────────────────────────────────────────────────────────
+// --- CORS helpers -----------------------------------------------------------
 
-/**
- * Returns CORS headers for a given request Origin.
- * Reflects the origin only if it is in the ALLOWED_ORIGINS list (or list is "*").
- */
 function corsHeaders(
   requestOrigin: string | null,
   allowedOrigins: string
@@ -144,17 +125,12 @@ function corsHeaders(
     .map((o) => o.trim())
     .filter(Boolean);
 
-  const isWildcard = origins.includes("*");
+  const isWildcard    = origins.includes("*");
   const originAllowed =
-    isWildcard ||
-    (requestOrigin !== null && origins.includes(requestOrigin));
+    isWildcard || (requestOrigin !== null && origins.includes(requestOrigin));
 
   const allowOrigin =
-    originAllowed && requestOrigin
-      ? requestOrigin // reflect exact origin (enables credentials support)
-      : isWildcard
-      ? "*"
-      : ""; // disallowed: no ACAO header → browser blocks
+    originAllowed && requestOrigin ? requestOrigin : isWildcard ? "*" : "";
 
   const headers: Record<string, string> = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
@@ -166,15 +142,13 @@ function corsHeaders(
 
   if (allowOrigin) {
     headers["Access-Control-Allow-Origin"] = allowOrigin;
-    if (!isWildcard) {
-      headers["Vary"] = "Origin";
-    }
+    if (!isWildcard) headers["Vary"] = "Origin";
   }
 
   return headers;
 }
 
-// ─── Response helpers ─────────────────────────────────────────────────────────
+// --- Response helpers -------------------------------------------------------
 
 function jsonResponse<T>(
   data: T,
@@ -183,11 +157,7 @@ function jsonResponse<T>(
 ): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      "Content-Type": "application/json",
-      ...securityHeaders(),
-      ...extra,
-    },
+    headers: { "Content-Type": "application/json", ...securityHeaders(), ...extra },
   });
 }
 
@@ -198,26 +168,14 @@ function errorResponse(
   extra: Record<string, string> = {}
 ): Response {
   return jsonResponse(
-    {
-      error: message,
-      code,
-      status,
-      timestamp: new Date().toISOString(),
-    },
+    { error: message, code, status, timestamp: new Date().toISOString() },
     status,
     extra
   );
 }
 
-// ─── Middleware: API key authentication ───────────────────────────────────────
+// --- Middleware: API key auth ------------------------------------------------
 
-/**
- * Validates the X-Api-Key header against the WORKER_API_KEY secret.
- * Returns null if valid (or auth is disabled), or a 401/403 Response.
- *
- * Auth is disabled when WORKER_API_KEY is empty — this allows local dev
- * without any key, but logs a warning so it is never silently skipped in prod.
- */
 function checkApiKey(
   request: Request,
   env: Env,
@@ -227,9 +185,9 @@ function checkApiKey(
 
   if (!expectedKey) {
     console.warn(
-      `[Worker][${requestId}] WORKER_API_KEY not set — auth is DISABLED. Set this secret before production.`
+      "[Worker][" + requestId + "] WORKER_API_KEY not set -- auth is DISABLED."
     );
-    return null; // bypass
+    return null;
   }
 
   const providedKey =
@@ -242,25 +200,18 @@ function checkApiKey(
       "Missing API key. Provide X-Api-Key header.",
       "MISSING_API_KEY",
       401,
-      {
-        "WWW-Authenticate": 'ApiKey realm="indic-voice-ai"',
-      }
+      { "WWW-Authenticate": 'ApiKey realm="indic-voice-ai"' }
     );
   }
 
-  // Constant-time comparison to prevent timing attacks
   if (!constantTimeEqual(providedKey, expectedKey)) {
-    console.warn(`[Worker][${requestId}] Invalid API key attempt.`);
+    console.warn("[Worker][" + requestId + "] Invalid API key attempt.");
     return errorResponse("Invalid API key.", "INVALID_API_KEY", 403);
   }
 
-  return null; // auth passed
+  return null;
 }
 
-/**
- * Constant-time string comparison — prevents timing side-channel attacks
- * on the API key check.
- */
 function constantTimeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let mismatch = 0;
@@ -270,54 +221,40 @@ function constantTimeEqual(a: string, b: string): boolean {
   return mismatch === 0;
 }
 
-// ─── Middleware: Per-IP rate limiting ─────────────────────────────────────────
+// --- Middleware: Per-IP rate limiting ----------------------------------------
 
 interface RateLimitResult {
   allowed: boolean;
   remaining: number;
-  resetAt: number; // Unix ms
+  resetAt: number;
   limit: number;
 }
 
-/**
- * Sliding-window rate limiter backed by KV.
- *
- * Algorithm:
- *   1. Derive a stable key from the client IP + current window index.
- *   2. Read the counter from KV (TTL = window duration).
- *   3. If count < limit → increment and allow.
- *   4. If count >= limit → reject with 429.
- *
- * The window slides by using floor(now / windowMs) as the window index,
- * so each window is fixed-width and aligned to clock time (not per-client).
- * This is simpler than a true sliding log but sufficient for abuse prevention.
- */
 async function checkRateLimit(
   request: Request,
   env: Env,
   requestId: string
 ): Promise<RateLimitResult> {
-  const limit = parseInt(env.RATE_LIMIT_REQUESTS ?? "20", 10);
+  const limit         = parseInt(env.RATE_LIMIT_REQUESTS ?? "20", 10);
   const windowSeconds = parseInt(env.RATE_LIMIT_WINDOW_SECONDS ?? "60", 10);
-  const windowMs = windowSeconds * 1000;
+  const windowMs      = windowSeconds * 1000;
 
   const clientIp =
     request.headers.get("CF-Connecting-IP") ??
     request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ??
     "unknown";
 
-  const now = Date.now();
+  const now         = Date.now();
   const windowIndex = Math.floor(now / windowMs);
   const windowStart = windowIndex * windowMs;
-  const resetAt = windowStart + windowMs;
+  const resetAt     = windowStart + windowMs;
 
-  // Sanitise IP for use as a KV key
   const safeIp = clientIp.replace(/[^a-zA-Z0-9.:_-]/g, "_").slice(0, 64);
-  const kvKey = `rl:${safeIp}:${windowIndex}`;
+  const kvKey  = "rl:" + safeIp + ":" + String(windowIndex);
 
   if (!env.RATE_LIMITER) {
     console.warn(
-      `[Worker][${requestId}] RATE_LIMITER KV not bound — rate limiting disabled.`
+      "[Worker][" + requestId + "] RATE_LIMITER KV not bound -- rate limiting disabled."
     );
     return { allowed: true, remaining: limit, resetAt, limit };
   }
@@ -327,7 +264,6 @@ async function checkRateLimit(
     ? (JSON.parse(raw) as RateLimitRecord)
     : { count: 0, window_start: windowStart };
 
-  // Guard against stale records from a previous window
   if (record.window_start !== windowStart) {
     record = { count: 0, window_start: windowStart };
   }
@@ -339,45 +275,37 @@ async function checkRateLimit(
   record.count += 1;
   const remaining = limit - record.count;
 
-  // Non-blocking write — TTL set to window + 10 s buffer for auto-cleanup
-  const writePromise = env.RATE_LIMITER.put(kvKey, JSON.stringify(record), {
+  void env.RATE_LIMITER.put(kvKey, JSON.stringify(record), {
     expirationTtl: windowSeconds + 10,
   });
-  void writePromise;
 
   return { allowed: true, remaining, resetAt, limit };
 }
 
-/** Build rate-limit response headers */
 function rateLimitHeaders(
   result: RateLimitResult,
   requestId: string
 ): Record<string, string> {
   return {
-    "X-RateLimit-Limit": String(result.limit),
+    "X-RateLimit-Limit":     String(result.limit),
     "X-RateLimit-Remaining": String(result.remaining),
-    "X-RateLimit-Reset": String(Math.ceil(result.resetAt / 1000)),
-    "X-Request-Id": requestId,
+    "X-RateLimit-Reset":     String(Math.ceil(result.resetAt / 1000)),
+    "X-Request-Id":          requestId,
   };
 }
 
-// ─── Route handlers ───────────────────────────────────────────────────────────
+// --- Route handlers ---------------------------------------------------------
 
-/**
- * GET /health
- * Returns service liveness + binding diagnostics.
- * Auth NOT required — allows uptime monitors without API keys.
- */
 async function handleHealth(env: Env, requestId: string): Promise<Response> {
   const body: HealthResponse = {
-    status: "ok",
-    version: env.WORKER_VERSION ?? "8.0.0",
+    status:    "ok",
+    version:   env.WORKER_VERSION ?? "8.0.0",
     timestamp: new Date().toISOString(),
     bindings: {
-      r2: typeof env.AUDIO_BUCKET !== "undefined",
-      kv: typeof env.JOB_STORE !== "undefined",
+      r2:           typeof env.AUDIO_BUCKET !== "undefined",
+      kv:           typeof env.JOB_STORE    !== "undefined",
       rate_limiter: typeof env.RATE_LIMITER !== "undefined",
-      backend: Boolean(env.BACKEND_URL),
+      backend:      Boolean(env.BACKEND_URL),
       auth_enabled: Boolean(env.WORKER_API_KEY?.trim()),
     },
     backend_url: env.BACKEND_URL ?? "(not set)",
@@ -385,37 +313,28 @@ async function handleHealth(env: Env, requestId: string): Promise<Response> {
   return jsonResponse(body, 200, { "X-Request-Id": requestId });
 }
 
-/**
- * POST /generate
- * Accepts multipart/form-data { audio, text, language, mode? }
- * Forwards to FastAPI backend and returns job_id immediately (202 Accepted).
- */
 async function handleGenerate(
   request: Request,
   env: Env,
   ctx: ExecutionContext,
   requestId: string
 ): Promise<Response> {
-  // Accept both JSON and multipart/form-data (frontend sends FormData)
   const contentType = request.headers.get("Content-Type") ?? "";
-  let text: string | null = null;
-  let language: string | null = null;
-  let voice: string | null = null;
-  let mode: string = "standard";
+  let text: string | null         = null;
+  let language: string | null     = null;
+  let voice: string | null        = null;
+  let mode: string                = "standard";
   let bodyToForward: BodyInit;
   let forwardContentType: string | null = null;
 
   if (contentType.includes("multipart/form-data")) {
-    // Forward the raw FormData to FastAPI
     const formData = await request.formData();
-    text = formData.get("text") as string | null;
+    text     = formData.get("text")     as string | null;
     language = formData.get("language") as string | null;
-    voice = formData.get("voice") as string | null;
-    mode = (formData.get("mode") as string) ?? "standard";
+    voice    = formData.get("voice")    as string | null;
+    mode     = (formData.get("mode")    as string) ?? "standard";
     bodyToForward = formData;
-    // Let fetch set the correct boundary automatically (no explicit Content-Type)
   } else {
-    // Assume JSON
     let body: GenerateRequest;
     try {
       body = (await request.json()) as GenerateRequest;
@@ -424,19 +343,18 @@ async function handleGenerate(
         "X-Request-Id": requestId,
       });
     }
-    text = body.text ?? null;
+    text     = body.text     ?? null;
     language = body.language ?? null;
-    voice = body.voice ?? null;
-    mode = body.mode ?? "standard";
-    bodyToForward = JSON.stringify({ text, language, voice, mode });
+    voice    = body.voice    ?? null;
+    mode     = body.mode     ?? "standard";
+    bodyToForward      = JSON.stringify({ text, language, voice, mode });
     forwardContentType = "application/json";
   }
 
   if (!text || text.trim().length === 0) {
     return errorResponse(
       "'text' is required and must be a non-empty string",
-      "MISSING_TEXT",
-      422,
+      "MISSING_TEXT", 422,
       { "X-Request-Id": requestId }
     );
   }
@@ -444,8 +362,7 @@ async function handleGenerate(
   if (!language || typeof language !== "string") {
     return errorResponse(
       "'language' is required (te | ta | hi | en)",
-      "MISSING_LANGUAGE",
-      422,
+      "MISSING_LANGUAGE", 422,
       { "X-Request-Id": requestId }
     );
   }
@@ -453,9 +370,8 @@ async function handleGenerate(
   const SUPPORTED_LANGUAGES = ["te", "ta", "hi", "en"];
   if (!SUPPORTED_LANGUAGES.includes(language)) {
     return errorResponse(
-      `Unsupported language '${language}'. Supported: ${SUPPORTED_LANGUAGES.join(", ")}`,
-      "UNSUPPORTED_LANGUAGE",
-      422,
+      "Unsupported language '" + language + "'. Supported: " + SUPPORTED_LANGUAGES.join(", "),
+      "UNSUPPORTED_LANGUAGE", 422,
       { "X-Request-Id": requestId }
     );
   }
@@ -463,8 +379,7 @@ async function handleGenerate(
   if (text.length > 5000) {
     return errorResponse(
       "'text' must be 5000 characters or fewer",
-      "TEXT_TOO_LONG",
-      422,
+      "TEXT_TOO_LONG", 422,
       { "X-Request-Id": requestId }
     );
   }
@@ -473,15 +388,14 @@ async function handleGenerate(
   if (!backendUrl) {
     return errorResponse(
       "Backend URL not configured",
-      "BACKEND_NOT_CONFIGURED",
-      503,
+      "BACKEND_NOT_CONFIGURED", 503,
       { "X-Request-Id": requestId }
     );
   }
 
   const forwardHeaders: Record<string, string> = {
     "X-Forwarded-By": "cf-worker",
-    "X-Request-Id": requestId,
+    "X-Request-Id":   requestId,
   };
   if (forwardContentType) {
     forwardHeaders["Content-Type"] = forwardContentType;
@@ -489,17 +403,19 @@ async function handleGenerate(
 
   let backendResponse: Response;
   try {
-    backendResponse = await fetch(`${backendUrl}/generate`, {
-      method: "POST",
+    backendResponse = await fetch(backendUrl + "/generate", {
+      method:  "POST",
       headers: forwardHeaders,
-      body: bodyToForward,
+      body:    bodyToForward,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown network error";
-    console.error(`[Worker][${requestId}] Backend fetch error:`, msg);
-    return errorResponse(`Backend unreachable: ${msg}`, "BACKEND_UNREACHABLE", 503, {
-      "X-Request-Id": requestId,
-    });
+    console.error("[Worker][" + requestId + "] Backend fetch error:", msg);
+    return errorResponse(
+      "Backend unreachable: " + msg,
+      "BACKEND_UNREACHABLE", 503,
+      { "X-Request-Id": requestId }
+    );
   }
 
   if (!backendResponse.ok) {
@@ -507,9 +423,7 @@ async function handleGenerate(
     try {
       const errBody = (await backendResponse.json()) as { detail?: string };
       detail = errBody.detail ?? detail;
-    } catch {
-      /* ignore parse errors */
-    }
+    } catch { /* ignore */ }
     return errorResponse(detail, "BACKEND_ERROR", backendResponse.status, {
       "X-Request-Id": requestId,
     });
@@ -521,29 +435,27 @@ async function handleGenerate(
   } catch {
     return errorResponse(
       "Backend returned non-JSON response",
-      "BACKEND_PARSE_ERROR",
-      502,
+      "BACKEND_PARSE_ERROR", 502,
       { "X-Request-Id": requestId }
     );
   }
 
   const jobId = jobData["job_id"] as string | undefined;
 
-  // Store initial KV record for Workers-native polling
   if (jobId && env.JOB_STORE) {
     const record: JobRecord = {
-      id: jobId,
-      status: "queued",
+      id:            jobId,
+      status:        "queued",
       language,
-      text: text.trim().slice(0, 200),
-      voice: (voice as string) ?? "",
-      mode: mode as "standard" | "clone",
-      output_key: null,
-      output_url: null,
+      text:          text.trim().slice(0, 200),
+      voice:         (voice as string) ?? "",
+      mode:          mode as "standard" | "clone",
+      output_key:    null,
+      output_url:    null,
       error_message: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      ttl_seconds: 28800,
+      created_at:    new Date().toISOString(),
+      updated_at:    new Date().toISOString(),
+      ttl_seconds:   28800,
     };
     ctx.waitUntil(
       env.JOB_STORE.put(jobId, JSON.stringify(record), {
@@ -553,25 +465,22 @@ async function handleGenerate(
   }
 
   console.log(
-    `[Worker][${requestId}] Job created: job_id=${jobId} lang=${language} mode=${mode}`
+    "[Worker][" + requestId + "] Job created: job_id=" + jobId +
+    " lang=" + language + " mode=" + mode
   );
 
   return jsonResponse(
     {
       ...jobData,
       worker_version: env.WORKER_VERSION ?? "8.0.0",
-      gateway: "cloudflare-workers",
-      request_id: requestId,
+      gateway:        "cloudflare-workers",
+      request_id:     requestId,
     },
     202,
     { "X-Request-Id": requestId }
   );
 }
 
-/**
- * GET /job/:id
- * KV-first lookup; falls back to FastAPI backend.
- */
 async function handleGetJob(
   jobId: string,
   env: Env,
@@ -595,7 +504,6 @@ async function handleGetJob(
         });
       }
 
-      // Inject R2 output URL if completed and url not yet set
       if (
         record.status === "completed" &&
         record.output_key &&
@@ -605,47 +513,47 @@ async function handleGetJob(
         try {
           const obj = await env.AUDIO_BUCKET.head(record.output_key);
           if (obj) {
-            record.output_url = `/files/${record.output_key}`;
+            record.output_url = "/files/" + record.output_key;
           }
-        } catch {
-          /* non-fatal */
-        }
+        } catch { /* non-fatal */ }
       }
 
       return jsonResponse(record, 200, { "X-Request-Id": requestId });
     }
   }
 
-  // Fallback to FastAPI
   const backendUrl = env.BACKEND_URL?.replace(/\/+$/, "");
   if (!backendUrl) {
     return errorResponse(
       "Job not found and backend not configured",
-      "NOT_FOUND",
-      404,
+      "NOT_FOUND", 404,
       { "X-Request-Id": requestId }
     );
   }
 
   let backendResponse: Response;
   try {
-    backendResponse = await fetch(`${backendUrl}/job/${jobId}`, {
+    backendResponse = await fetch(backendUrl + "/job/" + jobId, {
       headers: {
         "X-Forwarded-By": "cf-worker",
-        "X-Request-Id": requestId,
+        "X-Request-Id":   requestId,
       },
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown error";
-    return errorResponse(`Backend unreachable: ${msg}`, "BACKEND_UNREACHABLE", 503, {
-      "X-Request-Id": requestId,
-    });
+    return errorResponse(
+      "Backend unreachable: " + msg,
+      "BACKEND_UNREACHABLE", 503,
+      { "X-Request-Id": requestId }
+    );
   }
 
   if (backendResponse.status === 404) {
-    return errorResponse(`Job '${jobId}' not found`, "JOB_NOT_FOUND", 404, {
-      "X-Request-Id": requestId,
-    });
+    return errorResponse(
+      "Job '" + jobId + "' not found",
+      "JOB_NOT_FOUND", 404,
+      { "X-Request-Id": requestId }
+    );
   }
   if (!backendResponse.ok) {
     return errorResponse(
@@ -660,10 +568,6 @@ async function handleGetJob(
   return jsonResponse(jobData, 200, { "X-Request-Id": requestId });
 }
 
-/**
- * DELETE /job/:id
- * GDPR erasure: removes R2 blobs + KV record + backend copy.
- */
 async function handleDeleteJob(
   jobId: string,
   env: Env,
@@ -682,11 +586,7 @@ async function handleDeleteJob(
   if (env.JOB_STORE) {
     const raw = await env.JOB_STORE.get(jobId);
     if (raw) {
-      try {
-        outputKey = (JSON.parse(raw) as JobRecord).output_key;
-      } catch {
-        /* proceed */
-      }
+      try { outputKey = (JSON.parse(raw) as JobRecord).output_key; } catch { /* proceed */ }
       deletionTasks.push(env.JOB_STORE.delete(jobId));
     }
   }
@@ -696,36 +596,32 @@ async function handleDeleteJob(
   }
   if (env.AUDIO_BUCKET) {
     deletionTasks.push(
-      env.AUDIO_BUCKET.delete(`uploads/${jobId}_upload.wav`)
+      env.AUDIO_BUCKET.delete("uploads/" + jobId + "_upload.wav")
     );
   }
 
   const backendUrl = env.BACKEND_URL?.replace(/\/+$/, "");
   if (backendUrl) {
     deletionTasks.push(
-      fetch(`${backendUrl}/job/${jobId}`, {
-        method: "DELETE",
-        headers: {
-          "X-Forwarded-By": "cf-worker",
-          "X-Request-Id": requestId,
-        },
-      }).catch(() => {
-        /* non-fatal */
-      })
+      fetch(backendUrl + "/job/" + jobId, {
+        method:  "DELETE",
+        headers: { "X-Forwarded-By": "cf-worker", "X-Request-Id": requestId },
+      }).catch(() => { /* non-fatal */ })
     );
   }
 
   ctx.waitUntil(Promise.allSettled(deletionTasks));
 
-  console.log(`[Worker][${requestId}] GDPR delete scheduled for job: ${jobId}`);
+  console.log(
+    "[Worker][" + requestId + "] GDPR delete scheduled for job: " + jobId
+  );
 
   return jsonResponse(
     {
-      deleted: true,
-      job_id: jobId,
-      message:
-        "Job and associated audio files have been scheduled for deletion.",
-      timestamp: new Date().toISOString(),
+      deleted:    true,
+      job_id:     jobId,
+      message:    "Job and associated audio files have been scheduled for deletion.",
+      timestamp:  new Date().toISOString(),
       request_id: requestId,
     },
     200,
@@ -733,7 +629,7 @@ async function handleDeleteJob(
   );
 }
 
-// ─── Router ───────────────────────────────────────────────────────────────────
+// --- Router -----------------------------------------------------------------
 
 export default {
   async fetch(
@@ -741,58 +637,55 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ): Promise<Response> {
-    const url = new URL(request.url);
-    const { pathname } = url;
-    const method = request.method;
+    const url      = new URL(request.url);
+    const pathname = url.pathname;
+    const method   = request.method;
     const requestId = newRequestId();
 
-    const requestOrigin = request.headers.get("Origin");
+    const requestOrigin  = request.headers.get("Origin");
     const allowedOrigins = env.ALLOWED_ORIGINS ?? "*";
-    const cors = corsHeaders(requestOrigin, allowedOrigins);
+    const cors           = corsHeaders(requestOrigin, allowedOrigins);
 
-    // ── CORS preflight — no auth, no rate limit ───────────────────────────────
+    // CORS preflight -- no auth, no rate limit
     if (method === "OPTIONS") {
       return new Response(null, {
-        status: 204,
+        status:  204,
         headers: { ...cors, "X-Request-Id": requestId },
       });
     }
 
-    console.log(`[Worker][${requestId}] ${method} ${pathname}`);
+    console.log("[Worker][" + requestId + "] " + method + " " + pathname);
 
     try {
-      // ── /health is auth-exempt ────────────────────────────────────────────
+      // /health is auth-exempt
       if (pathname === "/health" && method === "GET") {
-        const res = await handleHealth(env, requestId);
+        const res     = await handleHealth(env, requestId);
         const headers = new Headers(res.headers);
         for (const [k, v] of Object.entries(cors)) headers.set(k, v);
         return new Response(res.body, { status: res.status, headers });
       }
 
-      // ── Auth middleware ───────────────────────────────────────────────────
+      // Auth middleware
       const authError = checkApiKey(request, env, requestId);
       if (authError) {
         const headers = new Headers(authError.headers);
         for (const [k, v] of Object.entries(cors)) headers.set(k, v);
-        return new Response(authError.body, {
-          status: authError.status,
-          headers,
-        });
+        return new Response(authError.body, { status: authError.status, headers });
       }
 
-      // ── Rate-limit middleware ─────────────────────────────────────────────
-      const rlResult = await checkRateLimit(request, env, requestId);
+      // Rate-limit middleware
+      const rlResult  = await checkRateLimit(request, env, requestId);
       const rlHeaders = rateLimitHeaders(rlResult, requestId);
 
       if (!rlResult.allowed) {
         const retryAfter = Math.ceil((rlResult.resetAt - Date.now()) / 1000);
         console.warn(
-          `[Worker][${requestId}] Rate limit exceeded. Reset in ${retryAfter}s`
+          "[Worker][" + requestId + "] Rate limit exceeded. Reset in " +
+          String(retryAfter) + "s"
         );
         const res = errorResponse(
-          `Rate limit exceeded. Try again in ${retryAfter} seconds.`,
-          "RATE_LIMIT_EXCEEDED",
-          429,
+          "Rate limit exceeded. Try again in " + String(retryAfter) + " seconds.",
+          "RATE_LIMIT_EXCEEDED", 429,
           { ...rlHeaders, "Retry-After": String(retryAfter) }
         );
         const headers = new Headers(res.headers);
@@ -800,7 +693,7 @@ export default {
         return new Response(res.body, { status: 429, headers });
       }
 
-      // ── Route dispatch ────────────────────────────────────────────────────
+      // Route dispatch
       let res: Response;
 
       if (pathname === "/generate" && method === "POST") {
@@ -815,32 +708,29 @@ export default {
             res = await handleDeleteJob(jobId, env, ctx, requestId);
           } else {
             res = errorResponse(
-              `Method ${method} not allowed on /job/:id`,
-              "METHOD_NOT_ALLOWED",
-              405,
+              "Method " + method + " not allowed on /job/:id",
+              "METHOD_NOT_ALLOWED", 405,
               { Allow: "GET, DELETE", "X-Request-Id": requestId }
             );
           }
         } else {
           res = errorResponse(
-            `Route not found: ${method} ${pathname}`,
-            "NOT_FOUND",
-            404,
+            "Route not found: " + method + " " + pathname,
+            "NOT_FOUND", 404,
             { "X-Request-Id": requestId }
           );
         }
       }
 
-      // Attach CORS + rate-limit headers to every authenticated response
       const headers = new Headers(res.headers);
-      for (const [k, v] of Object.entries(cors)) headers.set(k, v);
+      for (const [k, v] of Object.entries(cors))     headers.set(k, v);
       for (const [k, v] of Object.entries(rlHeaders)) headers.set(k, v);
       return new Response(res.body, { status: res.status, headers });
+
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Unexpected internal error";
+      const message = err instanceof Error ? err.message : "Unexpected internal error";
       console.error(
-        `[Worker][${requestId}] Unhandled error on ${method} ${pathname}:`,
+        "[Worker][" + requestId + "] Unhandled error on " + method + " " + pathname + ":",
         err
       );
       const res = errorResponse(message, "INTERNAL_ERROR", 500, {
