@@ -1,28 +1,20 @@
 """
 backend/main.py  — Phase 4B
-────────────────────────────
+────────────────────────────────────────────────
 IndicVoice AI API with voice cloning feature flag.
 
-New in Phase 4B:
-  POST /generate now accepts an optional `mode` field:
-    "standard"  (default) — EdgeTTS neural TTS, no cloning
-    "clone"                — OpenVoice v2 tone-colour transfer
-                             Falls back to EdgeTTS if OpenVoice
-                             models are not installed / enabled.
-
-  GET  /health   → now reports cloning_available flag.
-  GET  /job/{id} → job.meta carries the mode that was used
-                   and cloning_applied (True only if OpenVoice ran).
-
-Architecture:
-  All TTS logic is isolated behind the TTSProvider interface.
-  The job worker receives a pre-constructed provider (either
-  EdgeTTSProvider or OpenVoiceProvider) — it never imports a
-  concrete provider directly.
+Changes in this revision
+────────────────────────
+FIX-2a  _cleanup_expired_jobs() background coroutine runs every
+        CLEANUP_INTERVAL_S (30 min) and sweeps jobs older than
+        JOB_TTL_SECONDS (8 h). Prevents unbounded RAM and disk growth.
+FIX-2b  /health now includes active_jobs, total_jobs, outputs_dir_mb
+        so operators can see queue depth and disk usage at a glance.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -65,25 +57,85 @@ UPLOADS_DIR.mkdir(exist_ok=True)
 OUTPUTS_DIR.mkdir(exist_ok=True)
 
 # ── Feature flag: voice cloning ────────────────────────────────────────────
-# Set OPENVOICE_ENABLED=true in the environment to activate real cloning.
-# When false the "clone" mode still works but uses EdgeTTS internally.
 OPENVOICE_ENABLED: bool = os.getenv("OPENVOICE_ENABLED", "false").lower() == "true"
 
-# ── Singletons (created once at startup) ──────────────────────────────────
+# ── FIX-2a: TTL cleanup constants ─────────────────────────────────────────
+JOB_TTL_SECONDS:      float = float(os.getenv("JOB_TTL_SECONDS",      str(8 * 3600)))
+CLEANUP_INTERVAL_S:   float = float(os.getenv("CLEANUP_INTERVAL_S",   str(30 * 60)))
+
+# ── Singletons ─────────────────────────────────────────────────────────────
 job_manager  = LocalJobManager()
 storage      = LocalStorageBackend(base_dir=STORAGE_DIR, serve_prefix="/files")
-_edge_tts    = EdgeTTSProvider()   # default / fallback provider
+_edge_tts    = EdgeTTSProvider()
 
-# ── Lifespan ────────────────────────────────────────────────────────────────
+
+# ── FIX-2a: background TTL cleanup ────────────────────────────────────────
+async def _cleanup_expired_jobs() -> None:
+    """
+    Periodic background coroutine.
+    Sweeps all jobs older than JOB_TTL_SECONDS, deletes their storage
+    objects, and removes them from the job manager.
+
+    Runs every CLEANUP_INTERVAL_S seconds (default: 30 minutes).
+    Prevents unbounded RAM accumulation and disk fill on long-running instances.
+    """
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_S)
+        try:
+            now = time.time()
+            jobs = await job_manager.list_jobs()
+            evicted = 0
+            for job in jobs:
+                age = now - job.created_at
+                if age >= JOB_TTL_SECONDS:
+                    # Delete storage objects
+                    if job.output_key:
+                        try:
+                            await storage.delete(job.output_key)
+                        except Exception:
+                            pass  # already deleted or never written
+                    if job.meta and job.meta.upload_key:
+                        try:
+                            await storage.delete(job.meta.upload_key)
+                        except Exception:
+                            pass
+                    await job_manager.delete_job(job.id)
+                    evicted += 1
+            if evicted:
+                logger.info(
+                    "TTL cleanup: evicted %d expired jobs (ttl=%.0fh)",
+                    evicted, JOB_TTL_SECONDS / 3600,
+                )
+        except Exception as exc:
+            logger.warning("TTL cleanup error (non-fatal): %s", exc)
+
+
+def _outputs_dir_mb() -> float:
+    """Return approximate size of outputs/ directory in MB."""
+    try:
+        total = sum(f.stat().st_size for f in OUTPUTS_DIR.rglob("*") if f.is_file())
+        return round(total / (1024 * 1024), 2)
+    except Exception:
+        return 0.0
+
+
+# ── Lifespan ───────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(
-        "IndicVoice AI API starting  version=4.0.0  "
-        "openvoice_enabled=%s",
+        "IndicVoice AI API starting  version=4.0.0  openvoice_enabled=%s",
         OPENVOICE_ENABLED,
     )
+    # FIX-2a: start background TTL cleanup loop
+    cleanup_task = asyncio.create_task(_cleanup_expired_jobs())
     yield
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
     logger.info("IndicVoice AI API shutting down")
+
 
 # ── App ────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -92,9 +144,7 @@ app = FastAPI(
         "Backend API for IndicVoice AI — Phase 4B voice cloning MVP.\n\n"
         "**POST /generate** accepts a voice sample + text + language + mode and "
         "returns a `job_id` immediately (HTTP 202). "
-        "Poll **GET /job/{job_id}** for status and the output URL.\n\n"
-        "Set `mode=clone` to enable OpenVoice v2 tone-colour transfer "
-        "(requires `OPENVOICE_ENABLED=true` + checkpoints installed)."
+        "Poll **GET /job/{job_id}** for status and the output URL."
     ),
     version="4.0.0",
     docs_url="/docs",
@@ -131,37 +181,28 @@ SUPPORTED_MODES     = {"standard", "clone"}
 MAX_UPLOAD_BYTES    = 50 * 1024 * 1024
 ACCEPTED_EXTENSIONS = {".wav", ".mp3", ".ogg", ".webm", ".flac"}
 
-# ── Background worker ──────────────────────────────────────────────────────
 
+# ── Background worker ──────────────────────────────────────────────────────
 async def _run_tts_job(
     job_id:   str,
     text:     str,
     language: str,
     voice:    str,
     provider: TTSProvider,
-    mode:     str,           # BUG-2 FIX: passed in so we can write it back to meta
+    mode:     str,
 ) -> None:
     """
     Background task: runs TTS/voice-cloning inference and writes output.
-
-    State machine:
-      QUEUED → PROCESSING → COMPLETED
-                          → FAILED
-
-    The *provider* argument is a fully-constructed TTSProvider instance
-    (either EdgeTTSProvider or OpenVoiceProvider).  The worker never
-    imports a concrete provider — it only calls provider.synthesise().
+    State: QUEUED → PROCESSING → COMPLETED / FAILED
     """
     logger.info("Worker START  job_id=%s  provider=%s  mode=%s", job_id, provider.name, mode)
 
-    # Transition: QUEUED → PROCESSING
     try:
         await job_manager.update_status(job_id, JobStatus.PROCESSING)
     except KeyError:
         logger.error("Worker cannot find job_id=%s (already evicted?)", job_id)
         return
 
-    # Synthesise
     try:
         result = await provider.synthesise(
             SynthesisRequest(text=text, language=language, voice=voice)
@@ -195,12 +236,8 @@ async def _run_tts_job(
         )
         return
 
-    # BUG-2 FIX: determine whether real cloning was applied.
-    # OpenVoiceProvider sets result.cloning_applied when it runs the real
-    # ToneColorConverter; for all other providers it stays False.
     cloning_applied: bool = getattr(result, "cloning_applied", False)
 
-    # Persist output
     output_key = f"outputs/{job_id}_output.wav"
     try:
         await storage.put(output_key, result.wav_bytes, content_type="audio/wav")
@@ -213,13 +250,10 @@ async def _run_tts_job(
         )
         return
 
-    # BUG-2 FIX: write cloning_applied back to the job's meta so
-    # GET /job/{id} exposes it and the frontend can show real-vs-fallback.
     job = await job_manager.get_job(job_id)
     if job and job.meta:
         job.meta.cloning_applied = cloning_applied
 
-    # Transition: PROCESSING → COMPLETED
     await job_manager.update_status(
         job_id, JobStatus.COMPLETED,
         output_key=output_key,
@@ -231,6 +265,7 @@ async def _run_tts_job(
         job_id, provider.name, mode, cloning_applied,
         len(result.wav_bytes), result.duration_s,
     )
+
 
 # ── Routes ─────────────────────────────────────────────────────────────────
 
@@ -245,9 +280,21 @@ async def root():
         "health":            "/health",
     }
 
+
 @app.get("/health", tags=["System"], summary="Health check")
 async def health():
-    """Returns service status, TTS engine, cloning availability, and supported languages."""
+    """
+    Returns service status, TTS engine, cloning availability,
+    and supported languages.
+
+    FIX-2b: also returns active_jobs, total_jobs, outputs_dir_mb
+    for operator observability.
+    """
+    all_jobs    = await job_manager.list_jobs()
+    active_jobs = sum(
+        1 for j in all_jobs
+        if j.status in (JobStatus.QUEUED, JobStatus.PROCESSING)
+    )
     return {
         "status":            "ok",
         "service":           "IndicVoice AI API",
@@ -257,10 +304,7 @@ async def health():
         "cloning_available": OPENVOICE_ENABLED,
         "supported_modes":   sorted(SUPPORTED_MODES),
         "supported_languages": {
-            code: {
-                "name":  cfg["name"],
-                "voice": cfg["voice"],
-            }
+            code: {"name": cfg["name"], "voice": cfg["voice"]}
             for code, cfg in SUPPORTED_LANGUAGES.items()
         },
         "max_upload_mb":    MAX_UPLOAD_BYTES // (1024 * 1024),
@@ -268,7 +312,13 @@ async def health():
         "output_format":    "WAV (PCM 16-bit, 22050 Hz, mono)",
         "job_system":       "LocalJobManager (in-memory)",
         "storage_backend":  "LocalStorageBackend (filesystem)",
+        # FIX-2b: operator observability
+        "active_jobs":      active_jobs,
+        "total_jobs":       len(all_jobs),
+        "outputs_dir_mb":   _outputs_dir_mb(),
+        "job_ttl_hours":    round(JOB_TTL_SECONDS / 3600, 1),
     }
+
 
 @app.post(
     "/generate",
@@ -285,26 +335,8 @@ async def generate(
     mode:     str        = Form("standard", description="Mode: 'standard' (EdgeTTS) | 'clone' (OpenVoice v2)"),
 ):
     """
-    **Asynchronous** TTS / voice-cloning job submission.
-
-    Modes
-    ─────
-    * **standard** — EdgeTTS neural TTS (fast, ~3 s, no cloning)
-    * **clone**    — OpenVoice v2 tone-colour transfer
-      * Requires `OPENVOICE_ENABLED=true` + checkpoints installed.
-      * When OpenVoice is unavailable the job still completes using
-        EdgeTTS; `cloning_applied` in the job record will be `false`.
-
-    Flow
-    ────
-    1. Validates all inputs.
-    2. Saves the uploaded voice sample to storage.
-    3. Creates a job record (status = `queued`).
-    4. Starts a background worker with the appropriate provider.
-    5. Returns **HTTP 202** with `{ job_id, mode, poll_url }` immediately.
-
-    Poll **GET /job/{job_id}** until `status` is `completed` or `failed`.
-    When `completed`, the response contains `output_url` and `cloning_applied`.
+    Asynchronous TTS / voice-cloning job submission.
+    Returns HTTP 202 immediately; poll /job/{job_id} for status.
     """
     # ── Validate language ──────────────────────────────────────────────────
     if language not in SUPPORTED_LANGUAGES:
@@ -357,8 +389,6 @@ async def generate(
     logger.info("Upload saved  key=%s  size=%d  mode=%s", upload_key, len(content), mode)
 
     # ── Select provider ────────────────────────────────────────────────────
-    # "standard" → EdgeTTSProvider (stateless singleton)
-    # "clone"    → OpenVoiceProvider (per-request, carries reference audio)
     if mode == "clone":
         provider: TTSProvider = make_openvoice_provider(
             reference_audio=content,
@@ -369,15 +399,14 @@ async def generate(
 
     # ── Create job ─────────────────────────────────────────────────────────
     cfg  = SUPPORTED_LANGUAGES[language]
-    # BUG-2 FIX: store mode in JobMeta so GET /job/:id can report it
     meta = JobMeta(
         language=language,
         text=text,
         voice=cfg["voice"],
         upload_key=upload_key,
         sample_size_b=len(content),
-        mode=mode,                  # NEW
-        cloning_applied=False,      # NEW — updated by worker after inference
+        mode=mode,
+        cloning_applied=False,
     )
     job = await job_manager.create_job(meta)
 
@@ -389,7 +418,7 @@ async def generate(
         language=language,
         voice=cfg["voice"],
         provider=provider,
-        mode=mode,          # BUG-2 FIX: pass mode to worker
+        mode=mode,
     )
 
     logger.info(
@@ -400,12 +429,12 @@ async def generate(
     return JSONResponse(
         status_code=202,
         content={
-            "job_id":            job.id,
-            "status":            job.status.value,
-            "mode":              mode,
-            "cloning_enabled":   OPENVOICE_ENABLED and mode == "clone",
-            "poll_url":          f"/job/{job.id}",
-            "message":           "Job accepted. Poll poll_url for status.",
+            "job_id":          job.id,
+            "status":          job.status.value,
+            "mode":            mode,
+            "cloning_enabled": OPENVOICE_ENABLED and mode == "clone",
+            "poll_url":        f"/job/{job.id}",
+            "message":         "Job accepted. Poll poll_url for status.",
         },
         headers={
             "Location":    f"/job/{job.id}",
@@ -415,45 +444,25 @@ async def generate(
         },
     )
 
-@app.get(
-    "/job/{job_id}",
-    tags=["Voice"],
-    summary="Get job status",
-)
+
+@app.get("/job/{job_id}", tags=["Voice"], summary="Get job status")
 async def get_job(job_id: str):
     """
     Return the current status of a TTS / voice-cloning job.
-
-    | status       | meaning                                           |
-    |------------- |---------------------------------------------------|
-    | `queued`     | Job created, waiting for a worker                 |
-    | `processing` | TTS inference is running                          |
-    | `completed`  | WAV is ready — `output_url` is populated          |
-    | `failed`     | Unrecoverable error — `error_message` explains why|
-
-    When `status == completed`, fetch or play the audio at `output_url`.
-    The `cloning_applied` field is `true` only when OpenVoice v2 actually ran
-    (i.e. `OPENVOICE_ENABLED=true` + models loaded + inference succeeded).
+    `cloning_applied` is true only when OpenVoice v2 actually ran.
     """
     job = await job_manager.get_job(job_id)
     if job is None:
         raise HTTPException(
             status_code=404,
-            detail=f"Job '{job_id}' not found. It may have expired (TTL 8h) or never existed.",
+            detail=f"Job '{job_id}' not found. It may have expired (TTL {JOB_TTL_SECONDS/3600:.0f}h) or never existed.",
         )
     return job.to_dict()
 
-@app.delete(
-    "/job/{job_id}",
-    tags=["Voice"],
-    summary="Delete a job and its output (GDPR erasure)",
-)
+
+@app.delete("/job/{job_id}", tags=["Voice"], summary="Delete a job and its output")
 async def delete_job(job_id: str):
-    """
-    Remove a job record and its associated storage objects.
-    Useful for GDPR right-to-erasure requests and manual cleanup.
-    Returns 404 if the job does not exist.
-    """
+    """Remove a job record and its associated storage objects."""
     job = await job_manager.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
@@ -464,22 +473,12 @@ async def delete_job(job_id: str):
         await storage.delete(job.meta.upload_key)
 
     await job_manager.delete_job(job_id)
-
-    logger.info("Job deleted (GDPR)  job_id=%s", job_id)
+    logger.info("Job deleted  job_id=%s", job_id)
     return {"deleted": True, "job_id": job_id}
 
-@app.get(
-    "/jobs",
-    tags=["Voice"],
-    summary="List recent jobs (dev/debug)",
-)
+
+@app.get("/jobs", tags=["Voice"], summary="List recent jobs (dev/debug)")
 async def list_jobs():
-    """
-    Return all in-memory jobs (dev / debug only).
-    Auth-gate this endpoint before exposing to the public internet.
-    """
+    """Return all in-memory jobs. Auth-gate before exposing publicly."""
     jobs = await job_manager.list_jobs()
-    return {
-        "count": len(jobs),
-        "jobs":  [j.to_dict() for j in jobs],
-    }
+    return {"count": len(jobs), "jobs": [j.to_dict() for j in jobs]}
