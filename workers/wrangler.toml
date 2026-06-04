@@ -35,21 +35,17 @@ binding     = "AUDIO_BUCKET"
 bucket_name = "indic-voice-audio"
 
 # ── KV Namespace — job state ──────────────────────────────────────────────────
-# Create: wrangler kv namespace create indic-voice-jobs
-# Then paste the id values returned by the CLI below.
 [[kv_namespaces]]
 binding    = "JOB_STORE"
-id         = "REPLACE_WITH_KV_JOB_STORE_ID"
-preview_id = "REPLACE_WITH_KV_JOB_STORE_PREVIEW_ID"
+id         = "5e611c204c2f41ec8bb569dc94791d5b"
+preview_id = "5e611c204c2f41ec8bb569dc94791d5b"
 
 # ── KV Namespace — rate-limit counters ───────────────────────────────────────
 # Separate namespace keeps rate-limit TTLs isolated from job records.
-# Create: wrangler kv namespace create indic-voice-ratelimit
-# Then paste the id values returned by the CLI below.
 [[kv_namespaces]]
 binding    = "RATE_LIMITER"
-id         = "REPLACE_WITH_KV_RATELIMIT_ID"
-preview_id = "REPLACE_WITH_KV_RATELIMIT_PREVIEW_ID"
+id         = "89bfe3a3357749d3817e47e55a5a493b"
+preview_id = "89bfe3a3357749d3817e47e55a5a493b"
 
 # ── Local development ─────────────────────────────────────────────────────────
 [dev]
