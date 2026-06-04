@@ -39,6 +39,11 @@ It always submits mode=standard; OpenVoice is never touched.
 NOTE: This script does NOT claim any test passed.
 Results are only valid if you run it yourself against a live backend.
 
+Text limit
+──────────
+The backend accepts 1–2000 characters per request (raised from 500 in Phase 5).
+The test sentences used here are 50–80 characters each — well within both limits.
+
 Windows notes
 ─────────────
 This script explicitly reconfigures stdout/stderr to UTF-8 on startup so that
@@ -94,7 +99,7 @@ _UTF8_OK: bool = _configure_output()
 # Output constants — fall back to plain ASCII when UTF-8 is unavailable
 if _UTF8_OK:
     _SEP_HEAVY = "\u2550"   # ═
-    _SEP_LIGHT = "\u2500"   # ─  (U+2500 is more widely supported than U+2504)
+    _SEP_LIGHT = "\u2500"   # ─
     _PASS      = "\u2713 PASS"   # ✓ PASS
     _FAIL      = "\u2717 FAIL"   # ✗ FAIL
 else:
@@ -118,6 +123,7 @@ except ImportError:
 
 
 # ── Test sentences per language ───────────────────────────────────────────────
+# All sentences are 50–80 characters — well within the 2000-character limit.
 TEST_CASES: list[dict] = [
     {
         "language": "en",
@@ -163,15 +169,15 @@ def _make_silence_wav(
 
     buf = io.BytesIO()
     buf.write(b"RIFF")
-    buf.write(struct.pack("<I", data_len + 36))   # chunk size
+    buf.write(struct.pack("<I", data_len + 36))
     buf.write(b"WAVEfmt ")
-    buf.write(struct.pack("<I", 16))              # subchunk1 size
-    buf.write(struct.pack("<H", 1))               # PCM format
+    buf.write(struct.pack("<I", 16))
+    buf.write(struct.pack("<H", 1))
     buf.write(struct.pack("<H", channels))
     buf.write(struct.pack("<I", sample_rate))
     buf.write(struct.pack("<I", byte_rate))
     buf.write(struct.pack("<H", block_align))
-    buf.write(struct.pack("<H", 16))              # bits per sample
+    buf.write(struct.pack("<H", 16))
     buf.write(b"data")
     buf.write(struct.pack("<I", data_len))
     buf.write(pcm_bytes)
@@ -192,14 +198,16 @@ def check_health(base_url: str, timeout: int = 10) -> bool:
         r = requests.get(url, timeout=timeout)
         r.raise_for_status()
         data = r.json()
-        status = data.get("status", "?")
-        engine = data.get("tts_engine", "?")
+        status  = data.get("status", "?")
+        engine  = data.get("tts_engine", "?")
         cloning = data.get("cloning_available", False)
         langs   = list(data.get("supported_languages", {}).keys())
-        print(f"  status            : {status}")
-        print(f"  tts_engine        : {engine}")
-        print(f"  cloning_available : {cloning}")
+        max_len = data.get("max_text_length", "?")
+        print(f"  status             : {status}")
+        print(f"  tts_engine         : {engine}")
+        print(f"  cloning_available  : {cloning}")
         print(f"  supported_languages: {langs}")
+        print(f"  max_text_length    : {max_len}")
         if status == "ok":
             print(f"[HEALTH] {_PASS}")
             return True
@@ -281,12 +289,11 @@ def poll_job(
                 print(f"\n    job not found (404)")
                 return None
             r.raise_for_status()
-            data = r.json()
+            data   = r.json()
             status = data.get("status", "?")
             if status in ("completed", "failed"):
                 print()  # newline after dots
                 return data
-            # Still running — print a dot
             print(".", end="", flush=True)
             dots += 1
             time.sleep(poll_interval)
@@ -311,7 +318,6 @@ def download_wav(
     /files/outputs/...) and save to dest_path.
     Returns True on success.
     """
-    # output_url is relative (/files/outputs/...) — make it absolute
     if output_url.startswith("/"):
         full_url = f"{base_url.rstrip('/')}{output_url}"
     else:
@@ -387,15 +393,20 @@ def run_validation(
             results[lang] = False
             continue
 
-        output_url = job.get("output_url")
+        output_url    = job.get("output_url")
+        provider_name = job.get("provider_name", "?")
+        fallback_used = job.get("fallback_used", False)
+
         if not output_url:
             print(f"[{lang.upper()}] {_FAIL} -- completed but output_url is empty")
             results[lang] = False
             continue
 
         duration = job.get("completed_at", 0) - job.get("created_at", 0)
-        print(f"  job status : completed  (job duration ~{duration:.1f}s)")
-        print(f"  output_url : {output_url}")
+        print(f"  job status    : completed  (job duration ~{duration:.1f}s)")
+        print(f"  provider_name : {provider_name}")
+        print(f"  fallback_used : {fallback_used}")
+        print(f"  output_url    : {output_url}")
 
         # 3. Download
         dest = out_dir / f"{lang}_output.wav"
@@ -456,9 +467,8 @@ def main() -> None:
     if args.out:
         out_dir = Path(args.out)
     else:
-        # Default: validation_outputs/ at repo root (one level up from scripts/)
         repo_root = Path(__file__).resolve().parent.parent
-        out_dir = repo_root / "validation_outputs"
+        out_dir   = repo_root / "validation_outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Load or generate audio sample
@@ -468,11 +478,11 @@ def main() -> None:
             print(f"[ERROR] Sample file not found: {sample_path}")
             sys.stdout.flush()
             sys.exit(1)
-        sample_bytes = sample_path.read_bytes()
+        sample_bytes    = sample_path.read_bytes()
         sample_filename = sample_path.name
         print(f"[INFO] Using audio sample: {sample_path} ({len(sample_bytes)//1024} KB)")
     else:
-        sample_bytes = _make_silence_wav(duration_s=1.0)
+        sample_bytes    = _make_silence_wav(duration_s=1.0)
         sample_filename = "silence_sample.wav"
         print("[INFO] Using auto-generated 1-second silence WAV as sample.")
         print("       Standard TTS ignores the reference audio -- this is correct.")

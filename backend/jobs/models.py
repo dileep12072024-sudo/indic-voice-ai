@@ -3,6 +3,14 @@ backend/jobs/models.py
 ──────────────────────
 Job data model and status enum.
 Shared by all JobManager implementations (local, Cloudflare KV, Redis, etc.).
+
+Changes in Phase 5
+──────────────────
+UI-3  JobMeta gains two new fields:
+        fallback_used  — True when clone mode fell back to EdgeTTS
+        provider_name  — name string of the provider that actually ran
+      Job.to_dict() exposes both fields so GET /job/{id} clients
+      (and the premium UI) can show the correct status badge.
 """
 
 from __future__ import annotations
@@ -29,14 +37,16 @@ class JobMeta:
     Stored alongside the job record so the worker can act without
     re-reading the original HTTP request.
     """
-    language:         str                    # "te" | "ta" | "hi" | "en"
-    text:             str                    # text to synthesise
-    voice:            str                    # provider voice ID
-    upload_key:       str                    # storage key for the input audio sample
-    mode:             str = "standard"       # BUG-2 FIX: "standard" | "clone"
-    cloning_applied:  bool = False           # BUG-2 FIX: True only when OpenVoice ran
-    text_len:         int = 0
-    sample_size_b:    int = 0               # uploaded file size in bytes
+    language:        str                    # "te" | "ta" | "hi" | "en"
+    text:            str                    # text to synthesise
+    voice:           str                    # provider voice ID
+    upload_key:      str                    # storage key for the input audio sample
+    mode:            str  = "standard"      # "standard" | "clone"
+    cloning_applied: bool = False           # True only when OpenVoice ran
+    fallback_used:   bool = False           # UI-3: True when clone fell back to EdgeTTS
+    provider_name:   Optional[str] = None   # UI-3: name of provider that ran
+    text_len:        int  = 0
+    sample_size_b:   int  = 0               # uploaded file size in bytes
 
     def __post_init__(self) -> None:
         self.text_len = len(self.text)
@@ -69,18 +79,19 @@ class Job:
     def to_dict(self) -> dict:
         """Serialise to a plain dict suitable for JSON responses."""
         return {
-            "job_id":           self.id,
-            "status":           self.status.value,
-            "language":         self.meta.language        if self.meta else None,
-            "voice":            self.meta.voice           if self.meta else None,
-            "text_len":         self.meta.text_len        if self.meta else None,
-            # BUG-2 FIX: expose mode and cloning_applied so the frontend
-            # can show whether real OpenVoice cloning ran or EdgeTTS fallback was used.
-            "mode":             self.meta.mode            if self.meta else "standard",
-            "cloning_applied":  self.meta.cloning_applied if self.meta else False,
-            "output_url":       self.output_url,
-            "error_message":    self.error_message,
-            "created_at":       self.created_at,
-            "updated_at":       self.updated_at,
-            "completed_at":     self.completed_at,
+            "job_id":          self.id,
+            "status":          self.status.value,
+            "language":        self.meta.language          if self.meta else None,
+            "voice":           self.meta.voice             if self.meta else None,
+            "text_len":        self.meta.text_len          if self.meta else None,
+            "mode":            self.meta.mode              if self.meta else "standard",
+            "cloning_applied": self.meta.cloning_applied   if self.meta else False,
+            # UI-3: new fields — frontend uses these for the status badge
+            "fallback_used":   self.meta.fallback_used     if self.meta else False,
+            "provider_name":   self.meta.provider_name     if self.meta else None,
+            "output_url":      self.output_url,
+            "error_message":   self.error_message,
+            "created_at":      self.created_at,
+            "updated_at":      self.updated_at,
+            "completed_at":    self.completed_at,
         }

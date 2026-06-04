@@ -8,25 +8,25 @@
 
 ## Core question: can a real user use this app?
 
-**Yes — for Standard TTS, after applying the proxy fix in this commit.**
+**Yes — for Standard TTS, after applying the proxy fix in commit `c48fb0f`.**
 **No — for real Voice Cloning, without enabling OpenVoice + checkpoints.**
 
 ---
 
 ## Component status
 
-### ✅ Backend API — REAL and complete
+### ✅ Backend API — REAL and complete (Phase 5)
 
 | Endpoint | Status | Notes |
 |----------|--------|-------|
-| `GET /health` | ✅ Real | Returns version, cloning_available, languages, modes |
-| `POST /generate` | ✅ Real | Validates all inputs; returns 202 + poll_url |
-| `GET /job/{id}` | ✅ Real | Returns full job state including mode + cloning_applied |
+| `GET /health` | ✅ Real | Returns version, cloning_available, languages, modes, **max_text_length** |
+| `POST /generate` | ✅ Real | Validates all inputs; returns 202 + job_id + **provider_name** |
+| `GET /job/{id}` | ✅ Real | Returns full job state including mode, cloning_applied, **fallback_used**, **provider_name** |
 | `DELETE /job/{id}` | ✅ Real | GDPR erasure of record + files |
 | `GET /jobs` | ✅ Real | Debug list of in-memory jobs |
 
 Input validation covers: language (te/ta/hi/en), mode (standard/clone),
-text length (≤500 chars), file extension, empty file, 50 MB size limit.
+text length (**≤2000 chars** — raised from 500 in Phase 5), file extension, empty file, 50 MB size limit.
 
 ### ✅ Async job lifecycle — REAL
 
@@ -47,30 +47,64 @@ Output WAV written to `backend/outputs/` and served via `/files`.
 
 | Condition | Result |
 |-----------|--------|
-| `OPENVOICE_ENABLED=false` (default) | Falls back to EdgeTTS, `cloning_applied=false` |
-| `OPENVOICE_ENABLED=true`, no checkpoints | Falls back to EdgeTTS, `cloning_applied=false` |
-| `OPENVOICE_ENABLED=true`, checkpoints present, PyTorch installed | Real ToneColorConverter cloning, `cloning_applied=true` |
+| `OPENVOICE_ENABLED=false` (default) | Falls back to EdgeTTS, `cloning_applied=false`, `fallback_used=true` |
+| `OPENVOICE_ENABLED=true`, no checkpoints | Falls back to EdgeTTS, `cloning_applied=false`, `fallback_used=true` |
+| `OPENVOICE_ENABLED=true`, checkpoints present, PyTorch installed | Real ToneColorConverter cloning, `cloning_applied=true`, `fallback_used=false` |
 
 `requirements.txt` intentionally does **not** include PyTorch or the
 `openvoice` package. Real cloning requires manual setup (see `RUN_LOCALLY.md`).
 
-### ✅ Frontend Generate flow — REAL (proxy bug fixed in this commit)
+### ✅ Frontend — Premium UI (Phase 5 upgrade)
 
-1. Validate file (type, size) and text
+**New in Phase 5:**
+
+| Feature | Detail |
+|---------|--------|
+| Card-based section layout | Voice Sample · Text · Language · Mode · Status · Output |
+| Mobile-first responsive grid | Stacked on mobile (≤767 px), side-by-side on tablet/desktop (≥768 px) |
+| Drag-and-drop upload | Drop zone with live feedback; click-to-browse retained |
+| Character counter | Real-time 0/2000 display with colour-coded fill bar (cyan→lime→amber→red) |
+| 3-step progress indicator | Submitting → Processing → Completed, with checkmarks |
+| Clone status badge | **Real Clone** (green) / **Fallback** (orange) / **Standard TTS** (cyan) |
+| Provider name display | Shows `provider_name` from job response under audio player |
+| Actionable error messages | Copy-ready `start-backend.sh` / `.bat` commands in error text |
+| Blob URL revocation | Prevents memory leaks on repeated generations (FIX-4 retained) |
+| 50 MB client-side guard | Instant feedback before upload attempt (FIX-3 retained) |
+
+**Generate flow (retained from Phase 4B, extended):**
+1. Validate file (type, size) and text (1–2000 chars)
 2. `POST /generate` with multipart form (audio, text, language, mode)
-3. Poll `GET /job/{id}` every 2 s, timeout 120 s
-4. On `completed`: fetch `output_url`, create blob, feed AudioPlayer
-5. Error states: backend down, 4xx/5xx, timeout, empty blob — all handled
+3. Poll `GET /job/{id}` every 2 s, timeout 120 s — status badge updates live
+4. On `completed`: read `cloning_applied`, `fallback_used`, `provider_name` from response
+5. Fetch `output_url`, create blob URL, feed to AudioPlayer
+6. Error states: backend down, 4xx/5xx, timeout, empty blob — all handled with actionable messages
 
-**Fixed in this commit**: `vite.config.js` now proxies `/generate`, `/job`,
-`/health`, and `/files` to the backend. Previously only `/api` was proxied,
-causing the Generate button to fail on a fresh clone.
+---
 
-### ✅ Clone transparency — FIXED in this commit
+## New response fields (Phase 5)
 
-`GET /job/{id}` now returns `mode` and `cloning_applied` in the response.
-`cloning_applied=true` only when OpenVoice v2 actually ran inference.
-Previously, the job record had no way to tell real cloning from fallback.
+All three locations (`/generate` response, `/job/{id}` poll, `Job.to_dict()`):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `fallback_used` | `bool` | `true` when clone mode ran EdgeTTS fallback instead of OpenVoice |
+| `provider_name` | `str` | Name of the TTS provider that actually produced the audio |
+
+Existing fields `mode` and `cloning_applied` are unchanged and still present.
+
+---
+
+## Text limit (Phase 5)
+
+| Location | Before | After |
+|----------|--------|-------|
+| `backend/main.py` validation guard | `> 500` | `> 2000` |
+| `backend/main.py` Form description | `1–500 characters` | `1–2000 characters` |
+| `backend/main.py` MAX_TEXT_LENGTH constant | `500` | `2000` |
+| `backend/jobs/models.py` — no direct limit stored | n/a | n/a |
+| `frontend/src/components/VoiceCloner.jsx` | `500` | `2000` |
+| `GET /health` response | not exposed | `max_text_length: 2000` |
+| `scripts/test-standard-tts.py` docstring | `1–500` | `1–2000` |
 
 ---
 
@@ -79,18 +113,21 @@ Previously, the job record had no way to tell real cloning from fallback.
 - [ ] End-to-end Standard TTS for te / ta / hi / en (internet required)
 - [ ] Browser audio playback and WAV download
 - [ ] Confirm WAV files appear in `backend/outputs/`
-- [ ] Clone mode fallback: graceful, no crash, `cloning_applied=false`
-- [ ] Clone mode real: enable + install checkpoints; verify tone transfer
+- [ ] Clone mode fallback: graceful, no crash, `cloning_applied=false`, `fallback_used=true`
+- [ ] Clone mode real: enable + install checkpoints; verify tone transfer + `cloning_applied=true`
 - [ ] RAM / CPU measurements under actual synthesis
 - [ ] 2-minute polling timeout behaviour when backend is slow
+- [ ] Mobile layout at 320 px, 375 px, 768 px viewports
+- [ ] Drag-and-drop upload on Chrome, Safari, Firefox
 
 ---
 
 ## Known non-blockers (by inspection)
 
 - `App.jsx` shows a static "API Online" badge regardless of backend state.
-  This is cosmetic and was not changed (no UI redesign rule).
+  Cosmetic — not changed (nav bar change not requested).
 - `_pcm_to_wav()` is duplicated in `edge_tts_provider.py` and
-  `openvoice_provider.py`. This is intentional provider decoupling, not
-  dead code. Not removed.
+  `openvoice_provider.py`. Intentional provider decoupling, not dead code.
 - `GET /jobs` is an unauthenticated debug route. Not changed (no auth work rule).
+- `fallback_used` defaults to `mode == "clone" and not cloning_applied` in the
+  worker as a safe fallback if the provider result object does not expose the field.
