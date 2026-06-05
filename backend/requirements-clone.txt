@@ -3,56 +3,81 @@
 # Voice cloning dependencies — install AFTER requirements.txt.
 # These are intentionally separated so Standard TTS users do not need PyTorch.
 #
-# Usage:
-#   pip install -r requirements.txt          # Standard TTS only
-#   pip install -r requirements-clone.txt    # Add real voice cloning
-#   python -m unidic download                # MeloTTS language data
+# Usage (Windows PowerShell / Command Prompt):
+#   pip install -r requirements.txt
+#   pip install -r requirements-clone.txt
+#   python -m unidic download
 #
-# Then set environment variables before starting the backend:
-#   OPENVOICE_ENABLED=true
-#   OPENVOICE_CHECKPOINT_DIR=~/.cache/openvoice/v2
-#   OPENVOICE_DEVICE=cpu   (or cuda)
-#   OPENVOICE_AUTO_DOWNLOAD=true   # auto-fetch checkpoints from HuggingFace
+# Environment variables to set before starting the backend:
+#   $env:OPENVOICE_ENABLED        = "true"
+#   $env:OPENVOICE_CHECKPOINT_DIR = "$HOME\.cache\openvoice\v2"
+#   $env:OPENVOICE_DEVICE         = "cpu"           # or "cuda"
+#   $env:OPENVOICE_AUTO_DOWNLOAD  = "true"          # auto-fetch from HuggingFace
 #
-# Checkpoints (~300 MB) are auto-downloaded on first use when OPENVOICE_AUTO_DOWNLOAD=true.
-# Manual download: python -m checkpoint_manager download
+# Linux / macOS (bash):
+#   export OPENVOICE_ENABLED=true
+#   export OPENVOICE_CHECKPOINT_DIR=~/.cache/openvoice/v2
+#   export OPENVOICE_DEVICE=cpu
+#   export OPENVOICE_AUTO_DOWNLOAD=true
+#
+# Checkpoints (~300 MB) auto-download on first use when OPENVOICE_AUTO_DOWNLOAD=true.
+# Manual download: python backend/checkpoint_manager.py download
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── PyTorch (CPU build — remove +cpu suffix for CUDA) ────────────────────────
-# For CUDA 11.8: torch==2.2.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
-# For CUDA 12.1: torch==2.2.2+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.2.2+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+# ── PyTorch (CPU build — swap +cpu suffix for +cu118 / +cu121 for GPU) ───────
+# CUDA 11.8: torch==2.2.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+# CUDA 12.1: torch==2.2.2+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.2.2+cpu     --extra-index-url https://download.pytorch.org/whl/cpu
 torchaudio==2.2.2+cpu --extra-index-url https://download.pytorch.org/whl/cpu
 
 # ── OpenVoice v2 core ─────────────────────────────────────────────────────────
-openvoice @ git+https://github.com/myshell-ai/OpenVoice.git@main
-MeloTTS @ git+https://github.com/myshell-ai/MeloTTS.git@main
+# FIX-1: package metadata name in setup.py is "MyShell-OpenVoice" (not "openvoice").
+#         Using the correct name prevents the pip VCS name-mismatch error on Windows.
+MyShell-OpenVoice @ git+https://github.com/myshell-ai/OpenVoice.git@main
+
+# FIX-2: package metadata name in setup.py is "melotts" (not "MeloTTS").
+#         Pip is case-normalising but the exact name avoids ambiguity on all platforms.
+melotts @ git+https://github.com/myshell-ai/MeloTTS.git@main
 
 # ── Direct imports in openvoice_provider.py ──────────────────────────────────
+# NOTE: OpenVoice's install_requires already pins librosa==0.9.1 and numpy==1.22.0.
+#       We omit redundant version pins here to avoid pip resolver conflicts.
 soundfile>=0.12.1
-numpy>=1.22.0
-librosa>=0.9.1
+librosa                    # version pinned by OpenVoice (==0.9.1); do not re-pin
+numpy                      # version pinned by OpenVoice (==1.22.0); do not re-pin
 
-# ── Transitive requirements pulled by OpenVoice / MeloTTS ─────────────────────
-faster-whisper>=0.9.0      # VAD in se_extractor.get_se()
-wavmark>=0.0.3             # @MyShell audio watermark in ToneColorConverter
-pydub>=0.25.1              # Audio segment manipulation (MeloTTS)
+# ── Transitive requirements pulled by OpenVoice / MeloTTS ────────────────────
+faster-whisper             # VAD in se_extractor.get_se(); version pinned by OpenVoice
+wavmark>=0.0.3             # @MyShell audio watermark embedded by ToneColorConverter
+pydub>=0.25.1              # Audio segment manipulation (used by MeloTTS)
 langid>=1.1.6              # Language detection
 inflect>=7.0.0             # English text normalisation (MeloTTS)
-unidecode>=1.3.7           # Unicode normalisation (MeloTTS)
-eng_to_ipa>=0.0.2          # Phoneme conversion (MeloTTS)
-scipy>=1.9.0               # Signal processing (librosa transitive)
+unidecode>=1.3.7           # Unicode → ASCII normalisation (MeloTTS)
+eng_to_ipa>=0.0.2          # English phoneme conversion (MeloTTS)
+scipy>=1.9.0               # Signal processing (librosa transitive dep)
 
 # ── MeloTTS text processing ───────────────────────────────────────────────────
 jieba>=0.42.1              # Chinese word segmentation (MeloTTS zh path)
 pypinyin>=0.48.0           # Chinese pinyin conversion (MeloTTS zh path)
 
-# ── Required by OpenVoice VITS model ─────────────────────────────────────────
-monotonic-align @ git+https://github.com/resemble-ai/monotonic_align.git@main
+# ── Monotonic Alignment Search (required by OpenVoice VITS model) ─────────────
+# FIX-3: The git URL "@main" fails — resemble-ai/monotonic_align has only one
+#         branch named "master" (confirmed via GitHub API), not "main".
+#         The Cython .pyx extension also requires MSVC on Windows to compile.
+#
+#         Fix: use the official PyPI wheel instead.
+#         "resemble-monotonic-align" is the published package (Apr 2024, v1.2.1).
+#         It ships pre-built wheels for Linux, macOS, and Windows — no compiler needed.
+#
+#         If you need the source install instead:
+#           pip install git+https://github.com/resemble-ai/monotonic_align.git@master
+resemble-monotonic-align>=1.2.1
+
 cached-property>=1.5.2     # Python <3.8 compat shim used by some OV deps
 
-# ── HuggingFace Hub (checkpoint download) ────────────────────────────────────
-huggingface-hub>=0.20.3    # Used by checkpoint_manager.py for HF downloads
+# ── HuggingFace Hub (checkpoint auto-download in checkpoint_manager.py) ──────
+huggingface-hub>=0.20.3
 
 # ── Audio I/O / format conversion ────────────────────────────────────────────
-praat-parselmouth>=0.4.3   # Pitch analysis used by some se_extractor paths
+praat-parselmouth>=0.4.3   # Pitch analysis in some se_extractor code paths
+                           # Pre-built wheels available for Windows/macOS/Linux
