@@ -1,16 +1,21 @@
 """
-backend/voices/models.py  — Phase 6
-──────────────────────────────────────
+backend/voices/models.py  — Phase 7: Real Voice Cloning
+──────────────────────────────────────────────────────────
 VoiceProfile dataclass and VoiceStore:
   • JSON-file backed persistence  (voices.json in BASE_DIR)
   • Async-safe via asyncio.Lock
-  • Full CRUD: create / get / list / delete
+  • Full CRUD: create / get / list / delete / update
+  • cloning_ready flag: True only when speaker embedding extracted successfully
+  • embedding_key: storage key for the .npy speaker embedding tensor
+  • embedding_error: exact error string from failed extraction (never silenced)
 
 Design notes
 ────────────
 - No external dependencies beyond the stdlib.
 - JSON schema is intentionally flat so it survives future SQLite migration.
 - Sample audio bytes are stored on disk (uploads/) referenced by sample_key.
+- Speaker embeddings stored as .npy files referenced by embedding_key.
+- cloning_ready=False by default; set to True only after successful extraction.
 """
 
 from __future__ import annotations
@@ -33,18 +38,24 @@ logger = logging.getLogger("indicvoice.voices")
 class VoiceProfile:
     """A saved voice profile created from an uploaded audio sample."""
 
-    id:          str
-    name:        str            # user-visible display name
-    language:    str            # te / ta / hi / en
-    sample_key:  str            # storage key for the reference audio file
-    sample_size: int            # bytes
-    created_at:  float          # unix timestamp
-    description: str = ""       # optional free-text notes
-    tags:        list[str] = field(default_factory=list)
+    id:              str
+    name:            str            # user-visible display name
+    language:        str            # te / ta / hi / en
+    sample_key:      str            # storage key for the reference audio file
+    sample_size:     int            # bytes
+    created_at:      float          # unix timestamp
+    description:     str  = ""      # optional free-text notes
+    tags:            list  = field(default_factory=list)
+
+    # ── Cloning readiness (Phase 7) ────────────────────────────────────────
+    cloning_ready:   bool           = False   # True only after successful embedding extraction
+    embedding_key:   Optional[str]  = None    # storage key for the .npy speaker embedding
+    embedding_error: Optional[str]  = None    # exact error from last failed extraction
 
     # ── Serialisation ──────────────────────────────────────────────────────
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "VoiceProfile":
@@ -57,6 +68,9 @@ class VoiceProfile:
             created_at=d.get("created_at", time.time()),
             description=d.get("description", ""),
             tags=d.get("tags", []),
+            cloning_ready=d.get("cloning_ready", False),
+            embedding_key=d.get("embedding_key", None),
+            embedding_error=d.get("embedding_error", None),
         )
 
 
@@ -76,11 +90,11 @@ class VoiceStore:
     def __init__(self, base_dir: Path) -> None:
         self._path  = base_dir / self._DB_FILENAME
         self._lock  = asyncio.Lock()
-        self._cache: Optional[dict[str, VoiceProfile]] = None   # lazy load
+        self._cache: Optional[dict] = None   # lazy load
 
     # ── Internal helpers ───────────────────────────────────────────────────
 
-    def _load_sync(self) -> dict[str, VoiceProfile]:
+    def _load_sync(self) -> dict:
         """Read the JSON file and return an id-keyed dict.  No lock."""
         if not self._path.exists():
             return {}
@@ -91,14 +105,14 @@ class VoiceStore:
             logger.warning("VoiceStore: failed to load %s (%s) — starting empty", self._path, exc)
             return {}
 
-    def _save_sync(self, profiles: dict[str, VoiceProfile]) -> None:
+    def _save_sync(self, profiles: dict) -> None:
         """Atomically write profiles to disk.  No lock."""
         tmp = self._path.with_suffix(".tmp")
         payload = {"voices": [p.to_dict() for p in profiles.values()]}
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self._path)
 
-    async def _profiles(self) -> dict[str, VoiceProfile]:
+    async def _profiles(self) -> dict:
         """Return the cache, loading from disk once if needed.  Caller holds lock."""
         if self._cache is None:
             self._cache = self._load_sync()
@@ -106,7 +120,7 @@ class VoiceStore:
 
     # ── Public API ─────────────────────────────────────────────────────────
 
-    async def list_voices(self) -> list[VoiceProfile]:
+    async def list_voices(self) -> list:
         """Return all profiles sorted newest-first."""
         async with self._lock:
             profiles = await self._profiles()
@@ -125,7 +139,7 @@ class VoiceStore:
         sample_key:  str,
         sample_size: int,
         description: str = "",
-        tags:        Optional[list[str]] = None,
+        tags:        Optional[list] = None,
     ) -> VoiceProfile:
         """Persist a new voice profile and return it."""
         async with self._lock:
@@ -139,10 +153,44 @@ class VoiceStore:
                 created_at=time.time(),
                 description=description,
                 tags=tags or [],
+                cloning_ready=False,
+                embedding_key=None,
+                embedding_error=None,
             )
             profiles[profile.id] = profile
             self._save_sync(profiles)
             logger.info("VoiceStore: created id=%s name=%r lang=%s", profile.id, name, language)
+            return profile
+
+    async def update_voice(
+        self,
+        voice_id:        str,
+        cloning_ready:   Optional[bool] = None,
+        embedding_key:   Optional[str]  = None,
+        embedding_error: Optional[str]  = None,
+    ) -> Optional[VoiceProfile]:
+        """
+        Patch cloning metadata on an existing profile.
+        Returns updated profile, or None if not found.
+        Thread-safe: holds lock during read-modify-write.
+        """
+        async with self._lock:
+            profiles = await self._profiles()
+            profile = profiles.get(voice_id)
+            if profile is None:
+                logger.warning("VoiceStore.update_voice: id=%s not found", voice_id)
+                return None
+            if cloning_ready is not None:
+                profile.cloning_ready = cloning_ready
+            if embedding_key is not None:
+                profile.embedding_key = embedding_key
+            if embedding_error is not None:
+                profile.embedding_error = embedding_error
+            self._save_sync(profiles)
+            logger.info(
+                "VoiceStore: updated id=%s cloning_ready=%s embedding_key=%s",
+                voice_id, profile.cloning_ready, profile.embedding_key,
+            )
             return profile
 
     async def delete_voice(self, voice_id: str) -> bool:

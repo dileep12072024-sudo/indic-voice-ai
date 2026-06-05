@@ -12,9 +12,10 @@
 #   OPENVOICE_ENABLED=true
 #   OPENVOICE_CHECKPOINT_DIR=~/.cache/openvoice/v2
 #   OPENVOICE_DEVICE=cpu   (or cuda)
+#   OPENVOICE_AUTO_DOWNLOAD=true   # auto-fetch checkpoints from HuggingFace
 #
-# Checkpoints (~300 MB) must be downloaded separately.
-# See docs/VOICE_CLONING_READINESS.md — Step 3.
+# Checkpoints (~300 MB) are auto-downloaded on first use when OPENVOICE_AUTO_DOWNLOAD=true.
+# Manual download: python -m checkpoint_manager download
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── PyTorch (CPU build — remove +cpu suffix for CUDA) ────────────────────────
@@ -30,9 +31,9 @@ MeloTTS @ git+https://github.com/myshell-ai/MeloTTS.git@main
 # ── Direct imports in openvoice_provider.py ──────────────────────────────────
 soundfile>=0.12.1
 numpy>=1.22.0
-librosa==0.9.1
+librosa>=0.9.1
 
-# ── Transitive requirements pulled by OpenVoice/MeloTTS ──────────────────────
+# ── Transitive requirements pulled by OpenVoice / MeloTTS ─────────────────────
 faster-whisper>=0.9.0      # VAD in se_extractor.get_se()
 wavmark>=0.0.3             # @MyShell audio watermark in ToneColorConverter
 pydub>=0.25.1              # Audio segment manipulation (MeloTTS)
@@ -41,3 +42,17 @@ inflect>=7.0.0             # English text normalisation (MeloTTS)
 unidecode>=1.3.7           # Unicode normalisation (MeloTTS)
 eng_to_ipa>=0.0.2          # Phoneme conversion (MeloTTS)
 scipy>=1.9.0               # Signal processing (librosa transitive)
+
+# ── MeloTTS text processing ───────────────────────────────────────────────────
+jieba>=0.42.1              # Chinese word segmentation (MeloTTS zh path)
+pypinyin>=0.48.0           # Chinese pinyin conversion (MeloTTS zh path)
+
+# ── Required by OpenVoice VITS model ─────────────────────────────────────────
+monotonic-align @ git+https://github.com/resemble-ai/monotonic_align.git@main
+cached-property>=1.5.2     # Python <3.8 compat shim used by some OV deps
+
+# ── HuggingFace Hub (checkpoint download) ────────────────────────────────────
+huggingface-hub>=0.20.3    # Used by checkpoint_manager.py for HF downloads
+
+# ── Audio I/O / format conversion ────────────────────────────────────────────
+praat-parselmouth>=0.4.3   # Pitch analysis used by some se_extractor paths

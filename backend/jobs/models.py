@@ -4,13 +4,18 @@ backend/jobs/models.py
 Job data model and status enum.
 Shared by all JobManager implementations (local, Cloudflare KV, Redis, etc.).
 
+Changes in Phase 7 (Real Voice Cloning)
+────────────────────────────────────────
+CLONE-3  JobMeta gains a new field:
+            cloning_error  — exact error string when cloning failed
+          Job.to_dict() exposes it so GET /job/{id} clients can
+          display the exact failure reason (never silenced).
+
 Changes in Phase 5
 ──────────────────
-UI-3  JobMeta gains two new fields:
+UI-3  JobMeta gains two fields:
         fallback_used  — True when clone mode fell back to EdgeTTS
         provider_name  — name string of the provider that actually ran
-      Job.to_dict() exposes both fields so GET /job/{id} clients
-      (and the premium UI) can show the correct status badge.
 """
 
 from __future__ import annotations
@@ -42,9 +47,10 @@ class JobMeta:
     voice:           str                    # provider voice ID
     upload_key:      str                    # storage key for the input audio sample
     mode:            str  = "standard"      # "standard" | "clone"
-    cloning_applied: bool = False           # True only when OpenVoice ran
-    fallback_used:   bool = False           # UI-3: True when clone fell back to EdgeTTS
-    provider_name:   Optional[str] = None   # UI-3: name of provider that ran
+    cloning_applied: bool = False           # True only when OpenVoice ran successfully
+    fallback_used:   bool = False           # True when clone fell back to EdgeTTS
+    provider_name:   Optional[str] = None   # name of provider that ran
+    cloning_error:   Optional[str] = None   # CLONE-3: exact error from failed cloning
     text_len:        int  = 0
     sample_size_b:   int  = 0               # uploaded file size in bytes
 
@@ -86,9 +92,10 @@ class Job:
             "text_len":        self.meta.text_len          if self.meta else None,
             "mode":            self.meta.mode              if self.meta else "standard",
             "cloning_applied": self.meta.cloning_applied   if self.meta else False,
-            # UI-3: new fields — frontend uses these for the status badge
             "fallback_used":   self.meta.fallback_used     if self.meta else False,
             "provider_name":   self.meta.provider_name     if self.meta else None,
+            # CLONE-3: exact error reason — never silenced
+            "cloning_error":   self.meta.cloning_error     if self.meta else None,
             "output_url":      self.output_url,
             "error_message":   self.error_message,
             "created_at":      self.created_at,

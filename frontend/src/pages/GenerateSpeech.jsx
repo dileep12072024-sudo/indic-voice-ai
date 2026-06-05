@@ -2,7 +2,6 @@ import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { useSearchParams, Link } from 'react-router-dom'
 import AudioPlayer from '../components/AudioPlayer.jsx'
 
-const API = 'http://localhost:8000'
 const POLL_MS = 2000
 
 const LANGUAGES = [
@@ -12,31 +11,42 @@ const LANGUAGES = [
   { code: 'hi', label: 'Hindi' },
 ]
 const MAX_CHARS = 2000
-
 const LANG_LABELS = { te: 'Telugu', ta: 'Tamil', hi: 'Hindi', en: 'English' }
 
 function StatusStep({ step, current }) {
-  const done    = current > step
-  const active  = current === step
-  const labels  = ['Submitting', 'Processing', 'Completed']
+  const done   = current > step
+  const active = current === step
+  const labels = ['Submitting', 'Processing', 'Completed']
   return (
-    <div className={`flex items-center gap-2 text-sm ${
-      done ? 'text-emerald-600' : active ? 'text-indigo-600' : 'text-slate-400'
-    }`}>
+    <div className={`flex items-center gap-2 text-sm ${active ? 'text-indigo-600' : done ? 'text-emerald-600' : 'text-slate-400'}`}>
       <div className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 border-2 ${
-        done
-          ? 'bg-emerald-100 border-emerald-500'
-          : active
-          ? 'bg-indigo-100 border-indigo-500 animate-pulse'
-          : 'bg-slate-100 border-slate-300'
+        done ? 'border-emerald-500 bg-emerald-50' : active ? 'border-indigo-500 bg-indigo-50' : 'border-slate-300'
       }`}>
         {done
           ? <svg className="w-3 h-3 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
           : <span className="text-xs font-bold">{step}</span>
         }
       </div>
-      <span className={`font-medium ${active ? '' : ''}`}>{labels[step - 1]}</span>
+      <span className="font-medium">{labels[step - 1]}</span>
     </div>
+  )
+}
+
+// ── Cloning readiness badge shown inside voice selector ──────────────────────
+function VoiceReadinessBadge({ voice, cloningAvailable }) {
+  if (!cloningAvailable) return null
+  if (voice.cloning_ready) {
+    return (
+      <span className="text-xs text-emerald-600 font-medium">✓ Clone Ready</span>
+    )
+  }
+  if (voice.embedding_error) {
+    return (
+      <span className="text-xs text-red-500 font-medium" title={voice.embedding_error}>✗ Clone Unavailable</span>
+    )
+  }
+  return (
+    <span className="text-xs text-amber-600 font-medium">⟳ Processing…</span>
   )
 }
 
@@ -47,30 +57,37 @@ export default function GenerateSpeech() {
   const prefillLang      = searchParams.get('lang')       || 'en'
 
   // Form state
-  const [voices,   setVoices]   = useState([])
-  const [voiceId,  setVoiceId]  = useState(prefillVoiceId)
-  const [text,     setText]     = useState('')
-  const [language, setLanguage] = useState(prefillLang)
-  const [mode,     setMode]     = useState('standard')
+  const [voices,           setVoices]           = useState([])
+  const [cloningAvailable, setCloningAvailable] = useState(false)
+  const [voiceId,          setVoiceId]          = useState(prefillVoiceId)
+  const [text,             setText]             = useState('')
+  const [language,         setLanguage]         = useState(prefillLang)
+  const [mode,             setMode]             = useState('standard')
 
   // Job state
-  const [jobId,     setJobId]     = useState(null)
-  const [jobStatus, setJobStatus] = useState(null)  // queued|processing|completed|failed
-  const [outputUrl, setOutputUrl] = useState(null)
-  const [fallback,  setFallback]  = useState(false)
-  const [provider,  setProvider]  = useState('')
-  const [errorMsg,  setErrorMsg]  = useState(null)
-  const [submitting,setSubmitting]= useState(false)
+  const [jobId,          setJobId]          = useState(null)
+  const [jobStatus,      setJobStatus]      = useState(null)
+  const [outputUrl,      setOutputUrl]      = useState(null)
+  const [cloningApplied, setCloningApplied] = useState(false)
+  const [fallback,       setFallback]       = useState(false)
+  const [cloningError,   setCloningError]   = useState(null)
+  const [provider,       setProvider]       = useState('')
+  const [errorMsg,       setErrorMsg]       = useState(null)
+  const [submitting,     setSubmitting]     = useState(false)
 
   const pollRef = useRef(null)
 
-  // Load voice list
-  useEffect(() => {
-    fetch(`${API}/voices`)
-      .then(r => r.json())
-      .then(d => setVoices(d.voices || []))
-      .catch(() => {})
+  // Load voice list (includes cloning_ready + embedding_error)
+  const loadVoices = useCallback(async () => {
+    try {
+      const res  = await fetch('/voices')
+      const data = await res.json()
+      setVoices(data.voices || [])
+      setCloningAvailable(data.cloning_available || false)
+    } catch {}
   }, [])
+
+  useEffect(() => { loadVoices() }, [loadVoices])
 
   // Cleanup poll on unmount
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current) }, [])
@@ -78,14 +95,16 @@ export default function GenerateSpeech() {
   const startPolling = useCallback((id) => {
     pollRef.current = setInterval(async () => {
       try {
-        const res  = await fetch(`${API}/job/${id}`)
+        const res  = await fetch(`/job/${id}`)
         const data = await res.json()
         setJobStatus(data.status)
         if (data.status === 'completed') {
           clearInterval(pollRef.current)
           setOutputUrl(data.output_url)
-          setFallback(data.fallback_used  || false)
-          setProvider(data.provider_name  || '')
+          setCloningApplied(data.cloning_applied || false)
+          setFallback(data.fallback_used         || false)
+          setCloningError(data.cloning_error     || null)
+          setProvider(data.provider_name         || '')
         } else if (data.status === 'failed') {
           clearInterval(pollRef.current)
           setErrorMsg(data.error_message || 'Job failed')
@@ -105,7 +124,9 @@ export default function GenerateSpeech() {
     setOutputUrl(null)
     setJobId(null)
     setJobStatus(null)
+    setCloningApplied(false)
     setFallback(false)
+    setCloningError(null)
     setProvider('')
     setSubmitting(true)
 
@@ -116,7 +137,7 @@ export default function GenerateSpeech() {
     fd.append('mode',     mode)
 
     try {
-      const res = await fetch(`${API}/generate`, { method: 'POST', body: fd })
+      const res = await fetch('/generate', { method: 'POST', body: fd })
       if (!res.ok) {
         const body = await res.json().catch(() => ({ detail: res.statusText }))
         throw new Error(body.detail || res.statusText)
@@ -154,7 +175,12 @@ export default function GenerateSpeech() {
 
         {/* Voice selector */}
         <div className="card p-6 space-y-3">
-          <h2 className="text-sm font-semibold text-slate-800">Voice</h2>
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-slate-800">Voice</h2>
+            {cloningAvailable && mode === 'clone' && selectedVoice && (
+              <VoiceReadinessBadge voice={selectedVoice} cloningAvailable={cloningAvailable} />
+            )}
+          </div>
 
           {voices.length === 0 ? (
             <div className="rounded-xl bg-amber-50 border border-amber-200 px-4 py-3 flex items-center gap-3">
@@ -175,8 +201,8 @@ export default function GenerateSpeech() {
                   onClick={() => { setVoiceId(v.id); setLanguage(v.language) }}
                   className={`flex items-center gap-3 p-3 rounded-xl border text-left transition-colors duration-150 ${
                     voiceId === v.id
-                      ? 'border-indigo-500 bg-indigo-50 ring-2 ring-indigo-300'
-                      : 'border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50'
+                      ? 'border-indigo-400 bg-indigo-50'
+                      : 'border-slate-200 hover:border-slate-300 hover:bg-slate-50'
                   }`}
                 >
                   <div className="w-9 h-9 rounded-lg bg-indigo-100 flex items-center justify-center flex-shrink-0">
@@ -186,7 +212,17 @@ export default function GenerateSpeech() {
                   </div>
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium text-slate-900 truncate">{v.name}</p>
-                    <p className="text-xs text-slate-500">{LANG_LABELS[v.language] || v.language}</p>
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs text-slate-500">{LANG_LABELS[v.language] || v.language}</p>
+                      {cloningAvailable && (
+                        <span className={`text-xs font-medium ${
+                          v.cloning_ready ? 'text-emerald-600' :
+                          v.embedding_error ? 'text-red-500' : 'text-amber-600'
+                        }`}>
+                          {v.cloning_ready ? '· Ready' : v.embedding_error ? '· Unavailable' : '· Processing'}
+                        </span>
+                      )}
+                    </div>
                   </div>
                   {voiceId === v.id && (
                     <svg className="w-4 h-4 text-indigo-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
@@ -204,9 +240,7 @@ export default function GenerateSpeech() {
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-slate-800">Text</h2>
             <span className={`text-xs font-mono ${
-              text.length > MAX_CHARS * 0.95 ? 'text-red-500'
-              : text.length > MAX_CHARS * 0.8  ? 'text-amber-500'
-              : 'text-slate-400'
+              text.length > MAX_CHARS * 0.9 ? 'text-red-500' : 'text-slate-400'
             }`}>
               {text.length}/{MAX_CHARS}
             </span>
@@ -219,13 +253,10 @@ export default function GenerateSpeech() {
             onChange={e => setText(e.target.value.slice(0, MAX_CHARS))}
             required
           />
-          {/* char bar */}
           <div className="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
             <div
               className={`h-full rounded-full transition-all duration-200 ${
-                text.length > MAX_CHARS * 0.95 ? 'bg-red-500'
-                : text.length > MAX_CHARS * 0.8  ? 'bg-amber-400'
-                : 'bg-indigo-500'
+                text.length > MAX_CHARS * 0.9 ? 'bg-red-500' : 'bg-indigo-500'
               }`}
               style={{ width: `${Math.min(100, (text.length / MAX_CHARS) * 100)}%` }}
             />
@@ -250,6 +281,22 @@ export default function GenerateSpeech() {
               </select>
             </div>
           </div>
+          {/* Clone mode warning if voice not ready */}
+          {mode === 'clone' && cloningAvailable && selectedVoice && !selectedVoice.cloning_ready && (
+            <div className="mt-3 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-700">
+              {selectedVoice.embedding_error
+                ? <><strong>Clone Unavailable:</strong> {selectedVoice.embedding_error}</>
+                : <><strong>Processing:</strong> Speaker embedding is still being extracted. Cloning will fall back to Edge-TTS until ready.</>
+              }
+            </div>
+          )}
+          {mode === 'clone' && !cloningAvailable && (
+            <div className="mt-3 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-xs text-slate-600">
+              <strong>Voice cloning disabled.</strong> Set{' '}
+              <code className="bg-slate-100 px-1 rounded">OPENVOICE_ENABLED=true</code>{' '}
+              on the backend to enable real voice cloning.
+            </div>
+          )}
         </div>
 
         {/* Error */}
@@ -290,8 +337,8 @@ export default function GenerateSpeech() {
             <StatusStep step={3} current={stepIndex} />
           </div>
 
-          {/* Status badge */}
-          <div className="flex items-center gap-3">
+          {/* Status badges */}
+          <div className="flex flex-wrap items-center gap-2">
             {jobStatus === 'completed' && (
               <span className="badge badge-green">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> Completed
@@ -311,10 +358,35 @@ export default function GenerateSpeech() {
             {provider && (
               <span className="badge badge-slate text-xs">{provider}</span>
             )}
-            {fallback && (
-              <span className="badge badge-amber text-xs">EdgeTTS fallback</span>
+
+            {/* CLONE-3: cloning_applied / fallback_used badges */}
+            {jobStatus === 'completed' && mode === 'clone' && (
+              cloningApplied ? (
+                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 text-emerald-700 text-xs font-semibold px-2.5 py-0.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                  cloning_applied=true
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 text-amber-700 text-xs font-semibold px-2.5 py-0.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                  EdgeTTS fallback
+                </span>
+              )
+            )}
+            {jobStatus === 'completed' && mode === 'clone' && fallback && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-red-100 text-red-600 text-xs font-semibold px-2.5 py-0.5">
+                fallback_used=true
+              </span>
             )}
           </div>
+
+          {/* Cloning error detail */}
+          {cloningError && mode === 'clone' && !cloningApplied && (
+            <details className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs">
+              <summary className="text-amber-700 font-medium cursor-pointer select-none">Why did cloning fall back?</summary>
+              <p className="mt-1 text-amber-600 font-mono break-all">{cloningError}</p>
+            </details>
+          )}
 
           {/* Audio output */}
           {outputUrl && (

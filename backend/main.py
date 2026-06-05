@@ -1,28 +1,38 @@
 """
-backend/main.py  — Phase 6
-────────────────────────────────────────────────
+backend/main.py  — Phase 7: Real Reusable Voice Cloning
+────────────────────────────────────────────────────────
 IndicVoice AI API: TTS + voice cloning + voice profile library.
 
-What's new in Phase 6
+What's new in Phase 7
 ─────────────────────
-VOICE-1  Voice Profile CRUD
-         POST   /voices          — upload sample, name it, save profile
-         GET    /voices          — list all saved profiles
-         GET    /voices/{id}     — fetch one profile
-         DELETE /voices/{id}     — delete profile + sample file
+CLONE-1  Embedding extraction at voice-create time
+         POST /voices now triggers a background task that:
+           • calls extract_and_store_embedding() from openvoice_provider
+           • saves the .npy to embeddings/voice_{id}.npy
+           • updates VoiceProfile: cloning_ready=True / embedding_key / embedding_error
 
-VOICE-2  Engine abstraction
-         EngineAdapter protocol decouples provider selection from
-         route logic.  OpenVoice and EdgeTTS both implement it.
-         make_provider() is the single dispatch point.
+CLONE-2  Stored embedding used at generate time
+         GET /voices/{id} → load embedding_key → pass Path to OpenVoiceProvider
+         cloning_applied=True / fallback_used=False only if real cloning ran
 
-All Phase 5 changes retained
+CLONE-3  Full API exposure
+         POST /generate response: cloning_available, provider_name
+         GET  /job/{id}  response: cloning_applied, fallback_used, cloning_error
+         GET  /voices    response: cloning_ready, embedding_key, embedding_error
+         GET  /health    response: cloning_available
+
+CLONE-4  No fake results
+         cloning_applied=True ONLY when ToneColorConverter.convert() succeeded.
+         cloning_error contains exact exception text on failure.
+
+All Phase 6 changes retained
 ────────────────────────────
-UI-1  Text limit 2000 chars
-UI-2  /generate → fallback_used + provider_name
-UI-3  /job/{id} → same fields via Job.to_dict()
-FIX-2a  Background TTL cleanup
-FIX-2b  /health extended metrics
+VOICE-1  Voice Profile CRUD  (POST/GET/DELETE /voices)
+VOICE-2  Engine abstraction  (make_provider)
+UI-1     Text limit 2000 chars
+UI-2/3   fallback_used + provider_name in job response
+FIX-2a   Background TTL cleanup
+FIX-2b   /health extended metrics
 """
 
 from __future__ import annotations
@@ -45,11 +55,13 @@ from jobs import Job, JobMeta, JobStatus, LocalJobManager
 from providers import (
     EdgeTTSProvider,
     OpenVoiceProvider,
+    OpenVoiceSynthesisResult,
     SynthesisRequest,
     TTSNoAudioError,
     TTSProvider,
     TTSProviderError,
     TTSUnavailableError,
+    extract_and_store_embedding,
     make_openvoice_provider,
 )
 from storage import LocalStorageBackend
@@ -63,12 +75,14 @@ logging.basicConfig(
 logger = logging.getLogger("indicvoice")
 
 # ── Directories ────────────────────────────────────────────────────────────
-BASE_DIR    = Path(__file__).parent
-STORAGE_DIR = BASE_DIR
-UPLOADS_DIR = BASE_DIR / "uploads"
-OUTPUTS_DIR = BASE_DIR / "outputs"
+BASE_DIR       = Path(__file__).parent
+STORAGE_DIR    = BASE_DIR
+UPLOADS_DIR    = BASE_DIR / "uploads"
+OUTPUTS_DIR    = BASE_DIR / "outputs"
+EMBEDDINGS_DIR = BASE_DIR / "embeddings"   # CLONE-1: .npy speaker embeddings
 UPLOADS_DIR.mkdir(exist_ok=True)
 OUTPUTS_DIR.mkdir(exist_ok=True)
+EMBEDDINGS_DIR.mkdir(exist_ok=True)
 
 # ── Feature flags ─────────────────────────────────────────────────────────
 OPENVOICE_ENABLED: bool = os.getenv("OPENVOICE_ENABLED", "false").lower() == "true"
@@ -80,24 +94,86 @@ CLEANUP_INTERVAL_S: float = float(os.getenv("CLEANUP_INTERVAL_S", str(30 * 60)))
 # ── Singletons ─────────────────────────────────────────────────────────────
 job_manager  = LocalJobManager()
 storage      = LocalStorageBackend(base_dir=STORAGE_DIR, serve_prefix="/files")
-voice_store  = VoiceStore(base_dir=BASE_DIR)          # VOICE-1
+voice_store  = VoiceStore(base_dir=BASE_DIR)
 _edge_tts    = EdgeTTSProvider()
+
+
+# ── CLONE-1: Background embedding extraction ───────────────────────────────
+async def _extract_embedding_background(
+    voice_id:    str,
+    audio_bytes: bytes,
+) -> None:
+    """
+    Background task: extract speaker embedding and update VoiceProfile.
+    Runs after POST /voices returns to avoid blocking the HTTP response.
+    Sets cloning_ready=True and embedding_key on success;
+    sets embedding_error with exact exception text on failure.
+    """
+    logger.info("Embedding extraction START  voice_id=%s", voice_id)
+    dest_npy = EMBEDDINGS_DIR / f"voice_{voice_id}.npy"
+    embedding_key = f"embeddings/voice_{voice_id}.npy"
+
+    if not OPENVOICE_ENABLED:
+        # Record that we cannot extract — not an error, just disabled
+        await voice_store.update_voice(
+            voice_id=voice_id,
+            cloning_ready=False,
+            embedding_error=(
+                "OpenVoice is disabled (OPENVOICE_ENABLED=false). "
+                "Set OPENVOICE_ENABLED=true and install requirements-clone.txt, "
+                "then re-upload this voice to extract the embedding."
+            ),
+        )
+        logger.info(
+            "Embedding extraction SKIPPED (OpenVoice disabled)  voice_id=%s", voice_id
+        )
+        return
+
+    ok, err = await extract_and_store_embedding(
+        audio_bytes=audio_bytes,
+        dest_npy_path=dest_npy,
+    )
+
+    if ok:
+        await voice_store.update_voice(
+            voice_id=voice_id,
+            cloning_ready=True,
+            embedding_key=embedding_key,
+            embedding_error=None,
+        )
+        logger.info(
+            "Embedding extraction DONE  voice_id=%s  path=%s", voice_id, dest_npy
+        )
+    else:
+        await voice_store.update_voice(
+            voice_id=voice_id,
+            cloning_ready=False,
+            embedding_error=err,
+        )
+        logger.warning(
+            "Embedding extraction FAILED  voice_id=%s  error=%s", voice_id, err
+        )
 
 
 # ── VOICE-2: Engine abstraction ────────────────────────────────────────────
 def make_provider(
-    mode:             str,
-    reference_audio:  Optional[bytes] = None,
+    mode:                  str,
+    reference_audio:       Optional[bytes] = None,
+    stored_embedding_path: Optional[Path]  = None,
 ) -> TTSProvider:
     """
     Single dispatch point for provider selection.
 
     mode='standard'  → EdgeTTSProvider (always available)
     mode='clone'     → OpenVoiceProvider if OPENVOICE_ENABLED, else EdgeTTS fallback
+
+    CLONE-2: stored_embedding_path is passed through so OpenVoiceProvider
+    can load the pre-extracted .npy instead of re-extracting every time.
     """
     if mode == "clone":
         return make_openvoice_provider(
             reference_audio=reference_audio,
+            stored_embedding_path=stored_embedding_path,
             enabled=OPENVOICE_ENABLED,
         )
     return _edge_tts
@@ -146,7 +222,7 @@ def _outputs_dir_mb() -> float:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(
-        "IndicVoice AI API starting  version=6.0.0  openvoice_enabled=%s",
+        "IndicVoice AI API starting  version=7.0.0  openvoice_enabled=%s",
         OPENVOICE_ENABLED,
     )
     cleanup_task = asyncio.create_task(_cleanup_expired_jobs())
@@ -163,13 +239,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="IndicVoice AI API",
     description=(
-        "Backend API for IndicVoice AI — Phase 6 Voice Library.\n\n"
-        "**POST /voices** — save a named voice profile from an audio sample.\n"
-        "**GET  /voices** — list saved profiles.\n"
-        "**POST /generate** — run TTS / voice-cloning job (async).\n"
-        "Poll **GET /job/{job_id}** for status and output URL."
+        "Backend API for IndicVoice AI — Phase 7 Real Voice Cloning.\n\n"
+        "**POST /voices** — save a named voice profile; triggers background embedding extraction.\n"
+        "**GET  /voices** — list saved profiles with cloning_ready status.\n"
+        "**POST /generate** — run TTS / real voice-cloning job (async).\n"
+        "Poll **GET /job/{job_id}** for status, cloning_applied, fallback_used, cloning_error."
     ),
-    version="6.0.0",
+    version="7.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
@@ -194,7 +270,7 @@ app.add_middleware(
 app.mount("/files", StaticFiles(directory=str(STORAGE_DIR)), name="files")
 
 # ── Constants ──────────────────────────────────────────────────────────────
-SUPPORTED_LANGUAGES: dict[str, dict] = {
+SUPPORTED_LANGUAGES: dict = {
     "te": {"name": "Telugu",  "voice": "te-IN-ShrutiNeural"},
     "ta": {"name": "Tamil",   "voice": "ta-IN-PallaviNeural"},
     "hi": {"name": "Hindi",   "voice": "hi-IN-SwaraNeural"},
@@ -217,6 +293,7 @@ ACCEPTED_EXTENSIONS  = {".wav", ".mp3", ".ogg", ".webm", ".flac"}
     summary="Save a new voice profile",
 )
 async def create_voice(
+    background_tasks: BackgroundTasks,
     audio:       UploadFile = File(...,  description="Reference audio — WAV/MP3/OGG/WEBM/FLAC, max 50 MB"),
     name:        str        = Form(...,  description="Display name for this voice"),
     language:    str        = Form("en", description="Language code: te / ta / hi / en"),
@@ -225,8 +302,14 @@ async def create_voice(
 ):
     """
     Upload a voice sample and save it as a named profile.
-    Returns the created VoiceProfile.
-    The profile can then be referenced by id when calling /generate.
+    Returns the created VoiceProfile (cloning_ready=false initially).
+
+    CLONE-1: Immediately after saving, triggers a background task that:
+      1. Extracts the speaker embedding using OpenVoice se_extractor.
+      2. Stores it as embeddings/voice_{id}.npy.
+      3. Updates the profile: cloning_ready=true (or embedding_error on failure).
+
+    Poll GET /voices/{id} to check cloning_ready status.
     """
     # Validate language
     if language not in SUPPORTED_LANGUAGES:
@@ -269,7 +352,7 @@ async def create_voice(
     # Parse tags
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
 
-    # Create profile record
+    # Create profile record (cloning_ready=False initially)
     profile = await voice_store.create_voice(
         name=name,
         language=language,
@@ -280,10 +363,28 @@ async def create_voice(
     )
 
     logger.info(
-        "Voice profile created  id=%s  name=%r  lang=%s  size=%d",
-        profile.id, name, language, len(content),
+        "Voice profile created  id=%s  name=%r  lang=%s  size=%d  cloning_enabled=%s",
+        profile.id, name, language, len(content), OPENVOICE_ENABLED,
     )
-    return profile.to_dict()
+
+    # CLONE-1: trigger background embedding extraction
+    background_tasks.add_task(
+        _extract_embedding_background,
+        voice_id=profile.id,
+        audio_bytes=content,
+    )
+
+    # Return profile with cloning_available so frontend knows to poll
+    result = profile.to_dict()
+    result["cloning_available"] = OPENVOICE_ENABLED
+    result["message"] = (
+        "Voice profile created. Speaker embedding extraction started in background. "
+        "Poll GET /voices/{id} for cloning_ready status."
+        if OPENVOICE_ENABLED
+        else
+        "Voice profile created. OpenVoice is disabled — cloning_ready will remain false."
+    )
+    return result
 
 
 @app.get(
@@ -292,9 +393,13 @@ async def create_voice(
     summary="List all saved voice profiles",
 )
 async def list_voices():
-    """Return all saved voice profiles, newest-first."""
+    """Return all saved voice profiles, newest-first, with cloning_ready status."""
     profiles = await voice_store.list_voices()
-    return {"count": len(profiles), "voices": [p.to_dict() for p in profiles]}
+    return {
+        "count": len(profiles),
+        "cloning_available": OPENVOICE_ENABLED,
+        "voices": [p.to_dict() for p in profiles],
+    }
 
 
 @app.get(
@@ -303,11 +408,13 @@ async def list_voices():
     summary="Get a single voice profile",
 )
 async def get_voice(voice_id: str):
-    """Return one voice profile by id."""
+    """Return one voice profile by id, including cloning_ready / embedding_error."""
     profile = await voice_store.get_voice(voice_id)
     if profile is None:
         raise HTTPException(status_code=404, detail=f"Voice profile '{voice_id}' not found.")
-    return profile.to_dict()
+    result = profile.to_dict()
+    result["cloning_available"] = OPENVOICE_ENABLED
+    return result
 
 
 @app.delete(
@@ -316,7 +423,7 @@ async def get_voice(voice_id: str):
     summary="Delete a voice profile and its sample",
 )
 async def delete_voice(voice_id: str):
-    """Delete a voice profile and remove its stored audio sample."""
+    """Delete a voice profile, its audio sample, and its stored embedding."""
     profile = await voice_store.get_voice(voice_id)
     if profile is None:
         raise HTTPException(status_code=404, detail=f"Voice profile '{voice_id}' not found.")
@@ -327,13 +434,21 @@ async def delete_voice(voice_id: str):
     except Exception as exc:
         logger.warning("Could not delete sample for voice %s: %s", voice_id, exc)
 
+    # Remove embedding .npy
+    if profile.embedding_key:
+        emb_path = BASE_DIR / profile.embedding_key
+        try:
+            emb_path.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("Could not delete embedding for voice %s: %s", voice_id, exc)
+
     deleted = await voice_store.delete_voice(voice_id)
     logger.info("Voice profile deleted  id=%s", voice_id)
     return {"deleted": deleted, "voice_id": voice_id}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TTS / Generation endpoints (Phase 5 + VOICE-2 engine abstraction)
+# TTS / Generation endpoints
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def _run_tts_job(
@@ -382,9 +497,11 @@ async def _run_tts_job(
         )
         return
 
-    cloning_applied: bool = getattr(result, "cloning_applied", False)
-    fallback_used:   bool = getattr(result, "fallback_used",   mode == "clone" and not cloning_applied)
-    provider_name:   str  = getattr(result, "provider_name",   provider.name)
+    # CLONE-2: read cloning flags from OpenVoiceSynthesisResult
+    cloning_applied: bool         = getattr(result, "cloning_applied", False)
+    fallback_used:   bool         = getattr(result, "fallback_used",   mode == "clone" and not cloning_applied)
+    cloning_error:   Optional[str] = getattr(result, "cloning_error",   None)
+    provider_name:   str          = getattr(result, "provider_name",   provider.name)
 
     output_key = f"outputs/{job_id}_output.wav"
     try:
@@ -398,11 +515,13 @@ async def _run_tts_job(
         )
         return
 
+    # Persist flags to job meta
     job = await job_manager.get_job(job_id)
     if job and job.meta:
         job.meta.cloning_applied = cloning_applied
         job.meta.fallback_used   = fallback_used
         job.meta.provider_name   = provider_name
+        job.meta.cloning_error   = cloning_error
 
     await job_manager.update_status(
         job_id, JobStatus.COMPLETED,
@@ -410,8 +529,10 @@ async def _run_tts_job(
         output_url=output_url,
     )
     logger.info(
-        "Worker DONE  job_id=%s  provider=%s  cloning_applied=%s  fallback_used=%s  wav=%d bytes",
-        job_id, provider_name, cloning_applied, fallback_used, len(result.wav_bytes),
+        "Worker DONE  job_id=%s  provider=%s  cloning_applied=%s  "
+        "fallback_used=%s  cloning_error=%s  wav=%d bytes",
+        job_id, provider_name, cloning_applied, fallback_used,
+        cloning_error, len(result.wav_bytes),
     )
 
 
@@ -421,8 +542,8 @@ async def _run_tts_job(
 async def root():
     return {
         "service":           "IndicVoice AI API",
-        "version":           "6.0.0",
-        "phase":             "6 — Voice Library",
+        "version":           "7.0.0",
+        "phase":             "7 — Real Voice Cloning",
         "openvoice_enabled": OPENVOICE_ENABLED,
         "docs":              "/docs",
         "health":            "/health",
@@ -437,27 +558,29 @@ async def health():
         1 for j in all_jobs
         if j.status in (JobStatus.QUEUED, JobStatus.PROCESSING)
     )
+    ready_voices = sum(1 for v in all_voices if v.cloning_ready)
     return {
-        "status":             "ok",
-        "service":            "IndicVoice AI API",
-        "version":            "6.0.0",
-        "phase":              "6 — Voice Library",
-        "tts_engine":         _edge_tts.name,
-        "cloning_available":  OPENVOICE_ENABLED,
-        "supported_modes":    sorted(SUPPORTED_MODES),
+        "status":              "ok",
+        "service":             "IndicVoice AI API",
+        "version":             "7.0.0",
+        "phase":               "7 — Real Voice Cloning",
+        "tts_engine":          _edge_tts.name,
+        "cloning_available":   OPENVOICE_ENABLED,
+        "supported_modes":     sorted(SUPPORTED_MODES),
         "supported_languages": {
             code: {"name": cfg["name"], "voice": cfg["voice"]}
             for code, cfg in SUPPORTED_LANGUAGES.items()
         },
-        "max_text_length":    MAX_TEXT_LENGTH,
-        "max_upload_mb":      MAX_UPLOAD_BYTES // (1024 * 1024),
-        "accepted_formats":   sorted(ACCEPTED_EXTENSIONS),
-        "output_format":      "WAV (PCM 16-bit, 22050 Hz, mono)",
-        "voice_profiles":     len(all_voices),
-        "active_jobs":        active_jobs,
-        "total_jobs":         len(all_jobs),
-        "outputs_dir_mb":     _outputs_dir_mb(),
-        "job_ttl_hours":      round(JOB_TTL_SECONDS / 3600, 1),
+        "max_text_length":     MAX_TEXT_LENGTH,
+        "max_upload_mb":       MAX_UPLOAD_BYTES // (1024 * 1024),
+        "accepted_formats":    sorted(ACCEPTED_EXTENSIONS),
+        "output_format":       "WAV (PCM 16-bit, 22050 Hz, mono)",
+        "voice_profiles":      len(all_voices),
+        "voices_clone_ready": ready_voices,
+        "active_jobs":         active_jobs,
+        "total_jobs":          len(all_jobs),
+        "outputs_dir_mb":      _outputs_dir_mb(),
+        "job_ttl_hours":       round(JOB_TTL_SECONDS / 3600, 1),
     }
 
 
@@ -478,11 +601,16 @@ async def generate(
     """
     Async TTS / voice-cloning job submission.
 
-    Accepts either:
-    - a direct audio upload (``audio`` field), or
-    - a saved voice profile id (``voice_id`` field).
+    CLONE-2: When voice_id is given and mode=clone:
+      - Loads the VoiceProfile and checks cloning_ready.
+      - If cloning_ready=True: loads stored embedding_key (.npy) and passes it
+        to OpenVoiceProvider → real cloning runs → cloning_applied=True.
+      - If cloning_ready=False: still runs but cloning falls back to EdgeTTS
+        with exact reason (embedding not yet extracted / extraction failed).
 
     Returns HTTP 202 immediately; poll /job/{job_id} for completion.
+    Response includes: cloning_available, cloning_ready, provider_name.
+    Job result includes: cloning_applied, fallback_used, cloning_error.
     """
     # Validate language
     if language not in SUPPORTED_LANGUAGES:
@@ -509,9 +637,11 @@ async def generate(
             detail=f"'text' must be ≤ {MAX_TEXT_LENGTH} characters (got {len(text)}).",
         )
 
-    # Resolve audio bytes — from saved profile OR direct upload
-    content:    Optional[bytes] = None
-    upload_key: str             = ""
+    # Resolve audio bytes + stored embedding — from saved profile OR direct upload
+    content:               Optional[bytes] = None
+    upload_key:            str             = ""
+    stored_embedding_path: Optional[Path]  = None  # CLONE-2: pre-extracted .npy
+    profile_cloning_ready: bool            = False
 
     if voice_id:
         # Load sample from saved voice profile
@@ -528,8 +658,19 @@ async def generate(
                 status_code=500,
                 detail=f"Could not read sample for voice profile '{voice_id}'.",
             )
-        upload_key = profile.sample_key
-        language   = profile.language   # honour profile language
+        upload_key  = profile.sample_key
+        language    = profile.language   # honour profile language
+
+        # CLONE-2: resolve stored embedding path
+        if profile.embedding_key:
+            stored_embedding_path = BASE_DIR / profile.embedding_key
+            if not stored_embedding_path.exists():
+                logger.warning(
+                    "embedding_key set but file missing: %s", stored_embedding_path
+                )
+                stored_embedding_path = None
+        profile_cloning_ready = profile.cloning_ready
+
     elif audio is not None:
         # Direct upload path (legacy / standalone use)
         filename = audio.filename or "upload"
@@ -551,14 +692,20 @@ async def generate(
         job_id_tmp = uuid.uuid4().hex
         upload_key = f"uploads/{job_id_tmp}_sample{ext}"
         await storage.put(upload_key, content)
+        # No pre-extracted embedding for direct uploads — live extraction will run
+        profile_cloning_ready = False
     else:
         raise HTTPException(
             status_code=422,
             detail="Provide either 'voice_id' (saved profile) or 'audio' (direct upload).",
         )
 
-    # Select provider — VOICE-2 abstraction
-    provider = make_provider(mode=mode, reference_audio=content)
+    # CLONE-2: Select provider with stored embedding path
+    provider = make_provider(
+        mode=mode,
+        reference_audio=content,
+        stored_embedding_path=stored_embedding_path,
+    )
 
     # Create job
     cfg  = SUPPORTED_LANGUAGES[language]
@@ -586,20 +733,25 @@ async def generate(
     )
 
     logger.info(
-        "Job enqueued  job_id=%s  lang=%s  mode=%s  voice_id=%s  text_len=%d",
-        job.id, language, mode, voice_id or "(upload)", len(text),
+        "Job enqueued  job_id=%s  lang=%s  mode=%s  voice_id=%s  "
+        "cloning_ready=%s  embedding=%s  text_len=%d",
+        job.id, language, mode, voice_id or "(upload)",
+        profile_cloning_ready,
+        stored_embedding_path is not None,
+        len(text),
     )
 
     return JSONResponse(
         status_code=202,
         content={
-            "job_id":          job.id,
-            "status":          job.status.value,
-            "mode":            mode,
-            "cloning_enabled": OPENVOICE_ENABLED and mode == "clone",
-            "provider_name":   provider.name,
-            "poll_url":        f"/job/{job.id}",
-            "message":         "Job accepted. Poll poll_url for status.",
+            "job_id":           job.id,
+            "status":           job.status.value,
+            "mode":             mode,
+            "cloning_available": OPENVOICE_ENABLED and mode == "clone",
+            "cloning_ready":    profile_cloning_ready and mode == "clone",
+            "provider_name":    provider.name,
+            "poll_url":         f"/job/{job.id}",
+            "message":          "Job accepted. Poll poll_url for status.",
         },
         headers={
             "Location":    f"/job/{job.id}",
