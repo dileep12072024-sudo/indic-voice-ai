@@ -1,83 +1,104 @@
 # backend/requirements-clone.txt
 # ─────────────────────────────────────────────────────────────────────────────
 # Voice cloning dependencies — install AFTER requirements.txt.
-# These are intentionally separated so Standard TTS users do not need PyTorch.
 #
-# Usage (Windows PowerShell / Command Prompt):
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  ⚠  PYTHON VERSION REQUIREMENT — READ BEFORE INSTALLING  ⚠             ║
+# ║                                                                          ║
+# ║  Voice cloning (OpenVoice v2) requires Python 3.10 or 3.11.             ║
+# ║  Python 3.12, 3.13, and 3.14 are NOT compatible.                        ║
+# ║                                                                          ║
+# ║  Root cause: OpenVoice's own setup.py pins:                             ║
+# ║    numpy==1.22.0          → no cp312+ wheel on PyPI                     ║
+# ║    faster-whisper==0.9.0  → ctranslate2<3.17, no cp312+ wheel           ║
+# ║    librosa==0.9.1         → needs numba; numba has no cp312+ wheel      ║
+# ║    whisper-timestamped==1.14.2 → numba transitive dep                   ║
+# ║  These are upstream pins we cannot override without forking OpenVoice.  ║
+# ║                                                                          ║
+# ║  Standard TTS (Edge-TTS, no cloning) works on Python 3.9–3.14.         ║
+# ║  For cloning you must use a Python 3.10 or 3.11 virtual environment.    ║
+# ║                                                                          ║
+# ║  Windows quick-start (Python 3.10 alongside your existing install):     ║
+# ║    See docs/PYTHON_COMPATIBILITY.md for full step-by-step guide.        ║
+# ║                                                                          ║
+# ║  One-liner to create the correct venv on Windows:                       ║
+# ║    py -3.10 -m venv .venv-clone                                         ║
+# ║    .venv-clone\Scripts\Activate.ps1                                     ║
+# ║    pip install -r requirements.txt                                       ║
+# ║    pip install -r requirements-clone.txt                                ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+#
+# Usage:
 #   pip install -r requirements.txt
-#   pip install -r requirements-clone.txt
+#   pip install -r requirements-clone.txt      ← inside a Python 3.10/3.11 venv
 #   python -m unidic download
 #
-# Environment variables to set before starting the backend:
-#   $env:OPENVOICE_ENABLED        = "true"
-#   $env:OPENVOICE_CHECKPOINT_DIR = "$HOME\.cache\openvoice\v2"
-#   $env:OPENVOICE_DEVICE         = "cpu"           # or "cuda"
-#   $env:OPENVOICE_AUTO_DOWNLOAD  = "true"          # auto-fetch from HuggingFace
-#
-# Linux / macOS (bash):
-#   export OPENVOICE_ENABLED=true
-#   export OPENVOICE_CHECKPOINT_DIR=~/.cache/openvoice/v2
-#   export OPENVOICE_DEVICE=cpu
-#   export OPENVOICE_AUTO_DOWNLOAD=true
-#
-# Checkpoints (~300 MB) auto-download on first use when OPENVOICE_AUTO_DOWNLOAD=true.
-# Manual download: python backend/checkpoint_manager.py download
+# Environment variables:
+#   OPENVOICE_ENABLED=true
+#   OPENVOICE_CHECKPOINT_DIR=~/.cache/openvoice/v2
+#   OPENVOICE_DEVICE=cpu          (or cuda)
+#   OPENVOICE_AUTO_DOWNLOAD=true  (auto-fetch checkpoints from HuggingFace)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── PyTorch (CPU build — swap +cpu suffix for +cu118 / +cu121 for GPU) ───────
-# CUDA 11.8: torch==2.2.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
-# CUDA 12.1: torch==2.2.2+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.2.2+cpu     --extra-index-url https://download.pytorch.org/whl/cpu
-torchaudio==2.2.2+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+# ── PyTorch ──────────────────────────────────────────────────────────────────
+# torch>=2.9.0 added Python 3.14 support, but OpenVoice's dep chain (numpy==1.22.0,
+# faster-whisper==0.9.0, librosa==0.9.1) limits you to Python 3.10/3.11 regardless.
+# We unpin the torch version so pip picks the correct wheel for your Python version.
+#
+# CPU wheels are served from the PyTorch index — add this flag to your pip call:
+#   pip install -r requirements-clone.txt \
+#       --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# Or install torch/torchaudio manually first:
+#   pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# CUDA 11.8:  --extra-index-url https://download.pytorch.org/whl/cu118
+# CUDA 12.1:  --extra-index-url https://download.pytorch.org/whl/cu121
+# CUDA 12.4:  --extra-index-url https://download.pytorch.org/whl/cu124
+torch>=2.0.0,<3.0.0
+torchaudio>=2.0.0,<3.0.0
 
 # ── OpenVoice v2 core ─────────────────────────────────────────────────────────
-# FIX-1: package metadata name in setup.py is "MyShell-OpenVoice" (not "openvoice").
-#         Using the correct name prevents the pip VCS name-mismatch error on Windows.
+# Package metadata name is "MyShell-OpenVoice" (not "openvoice").
+# The installed import path remains: from openvoice import se_extractor
 MyShell-OpenVoice @ git+https://github.com/myshell-ai/OpenVoice.git@main
 
-# FIX-2: package metadata name in setup.py is "melotts" (not "MeloTTS").
-#         Pip is case-normalising but the exact name avoids ambiguity on all platforms.
+# Package metadata name is "melotts" (not "MeloTTS").
 melotts @ git+https://github.com/myshell-ai/MeloTTS.git@main
 
 # ── Direct imports in openvoice_provider.py ──────────────────────────────────
-# NOTE: OpenVoice's install_requires already pins librosa==0.9.1 and numpy==1.22.0.
-#       We omit redundant version pins here to avoid pip resolver conflicts.
+# NOTE: OpenVoice's install_requires pins numpy==1.22.0 and librosa==0.9.1.
+# Do NOT add conflicting version pins here — let OpenVoice's constraints govern.
 soundfile>=0.12.1
-librosa                    # version pinned by OpenVoice (==0.9.1); do not re-pin
-numpy                      # version pinned by OpenVoice (==1.22.0); do not re-pin
+librosa             # version pinned to ==0.9.1 by OpenVoice install_requires
+numpy               # version pinned to ==1.22.0 by OpenVoice install_requires
 
 # ── Transitive requirements pulled by OpenVoice / MeloTTS ────────────────────
-faster-whisper             # VAD in se_extractor.get_se(); version pinned by OpenVoice
-wavmark>=0.0.3             # @MyShell audio watermark embedded by ToneColorConverter
-pydub>=0.25.1              # Audio segment manipulation (used by MeloTTS)
-langid>=1.1.6              # Language detection
-inflect>=7.0.0             # English text normalisation (MeloTTS)
-unidecode>=1.3.7           # Unicode → ASCII normalisation (MeloTTS)
-eng_to_ipa>=0.0.2          # English phoneme conversion (MeloTTS)
-scipy>=1.9.0               # Signal processing (librosa transitive dep)
+faster-whisper      # version pinned to ==0.9.0 by OpenVoice install_requires
+wavmark>=0.0.3      # @MyShell audio watermark embedded by ToneColorConverter
+pydub>=0.25.1       # Audio segment manipulation (MeloTTS)
+langid>=1.1.6       # Language detection
+inflect>=7.0.0      # English text normalisation (MeloTTS)
+unidecode>=1.3.7    # Unicode normalisation (MeloTTS)
+eng_to_ipa>=0.0.2   # English phoneme conversion (MeloTTS)
+scipy>=1.9.0        # Signal processing (librosa transitive dep)
 
 # ── MeloTTS text processing ───────────────────────────────────────────────────
-jieba>=0.42.1              # Chinese word segmentation (MeloTTS zh path)
-pypinyin>=0.48.0           # Chinese pinyin conversion (MeloTTS zh path)
+jieba>=0.42.1       # Chinese word segmentation (MeloTTS zh path)
+pypinyin>=0.48.0    # Chinese pinyin conversion (MeloTTS zh path)
 
-# ── Monotonic Alignment Search (required by OpenVoice VITS model) ─────────────
-# FIX-3: The git URL "@main" fails — resemble-ai/monotonic_align has only one
-#         branch named "master" (confirmed via GitHub API), not "main".
-#         The Cython .pyx extension also requires MSVC on Windows to compile.
-#
-#         Fix: use the official PyPI wheel instead.
-#         "resemble-monotonic-align" is the published package (Apr 2024, v1.2.1).
-#         It ships pre-built wheels for Linux, macOS, and Windows — no compiler needed.
-#
-#         If you need the source install instead:
-#           pip install git+https://github.com/resemble-ai/monotonic_align.git@master
+# ── Monotonic Alignment Search ────────────────────────────────────────────────
+# Using PyPI wheel — avoids both issues:
+#   1. resemble-ai/monotonic_align has only branch "master" (not "main")
+#   2. Cython .pyx compilation requires MSVC on Windows
+# resemble-monotonic-align ships pre-built wheels for Windows/Linux/macOS.
+# Git source fallback: pip install git+https://github.com/resemble-ai/monotonic_align.git@master
 resemble-monotonic-align>=1.2.1
 
-cached-property>=1.5.2     # Python <3.8 compat shim used by some OV deps
+cached-property>=1.5.2    # Python <3.8 compat shim used by some OV deps
 
 # ── HuggingFace Hub (checkpoint auto-download in checkpoint_manager.py) ──────
 huggingface-hub>=0.20.3
 
-# ── Audio I/O / format conversion ────────────────────────────────────────────
-praat-parselmouth>=0.4.3   # Pitch analysis in some se_extractor code paths
-                           # Pre-built wheels available for Windows/macOS/Linux
+# ── Audio I/O ─────────────────────────────────────────────────────────────────
+praat-parselmouth>=0.4.3  # Pre-built wheels for Windows/macOS/Linux
